@@ -1019,9 +1019,9 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   // (averaging tempers peak-cycle margins).
   var mF = ovM !== null ? ovM : mean_([fcfMarginNow, fcfMarginAvg]);
   if (ovM === null && (mF === null || mF <= 0) && netMarginNow > 0) mF = mean_([netMarginNow, netMarginAvg > 0 ? netMarginAvg : null]);
-  if (mF === null || mF <= 0) { mF = S.defFcfMargin; if (ovM === null) out.notes.push('Default FCF margin used'); }
+  if (mF === null || mF <= 0) { mF = S.defFcfMargin; if (ovM === null && type !== 'Financial') out.notes.push('Default FCF margin used'); }
   var mN = ovM !== null ? ovM : mean_([netMarginNow, netMarginAvg]);
-  if (mN === null || mN <= 0) { mN = S.defNetMargin; if (ovM === null) out.notes.push('Default net margin used'); }
+  if (mN === null || mN <= 0) { mN = S.defNetMargin; if (ovM === null && type !== 'Financial') out.notes.push('Default net margin used'); }
   mF = Math.min(mF, 0.6); mN = Math.min(mN, 0.6);
 
   // Possible cyclical peak: an established company (revenue >= 5bn three years ago) in a cyclical industry, revenue up >50% in a year AND net margin
@@ -1064,24 +1064,32 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     M['5-yr earnings'] = p5.fv;
     out.target5 = p5.target;
   }
-  if (epsBase !== null && epsBase > 0) {
-    var useEstEps = consensus && !peak && estEps2 !== null && estEps2 > 0;
+  var useEstEps = consensus && !peak && estEps2 !== null && estEps2 > 0;
+  if (useEstEps || (epsBase !== null && epsBase > 0)) {
     var eps2 = useEstEps ? estEps2 * fx : epsBase * (1 + path[0]) * (1 + path[1]);
     if (useEstEps) out.notes.push('Fwd EPS x P/E uses consensus EPS (analysts often use adjusted EPS)');
     var epsYears = useEstEps ? yearsAhead : 2;
-    M['Fwd EPS x P/E'] = eps2 * exitMultiple_(avgRange(3, 7), S.peCap) / Math.pow(1 + S.req, epsYears);
+    // Financials: modest multiple (banks/insurers rarely sustain growth multiples); growth from revenue is unreliable for them.
+    var fwdPE = type === 'Financial' ? clamp_(8.5 + 2 * Math.min(avgRange(3, 7), gT) * 100, 8, Math.min(S.peCap, 14.5)) : exitMultiple_(avgRange(3, 7), S.peCap);
+    M['Fwd EPS x P/E'] = eps2 * fwdPE / Math.pow(1 + S.req, epsYears);
+  }
+  if (epsBase !== null && epsBase > 0) {
     var gG = Math.min(avgRange(1, 10) * 100, 15);
     if (S.aaa > 0) M['Graham'] = epsBase * (8.5 + 2 * gG) * 4.4 / (S.aaa * 100);
     var gL = Math.min(avgRange(1, 5) * 100, 25);
     if (gL >= 5) M['Lynch'] = epsBase * gL;
   }
   if (price && div > 0 && div / (price * shares) >= 0.015) {
-    var gD = Math.min(avgRange(1, 10), r - 0.02, 0.06);
+    // Dividend growth (perpetual, so no higher than terminal growth): 3-year growth in dividend per share where available.
+    var d0 = fy('DividendsPaid', 0), d3 = fy('DividendsPaid', 3), s0 = n_(raw['DilutedShares FY0']), s3 = n_(raw['DilutedShares FY-3']);
+    var dpsCagr = d0 && d3 && s0 && s3 && d3 > 0 ? Math.pow(Math.abs(d0) / s0 / (Math.abs(d3) / s3), 1 / 3) - 1 : null;
+    var gD = dpsCagr !== null && isFinite(dpsCagr) ? clamp_(dpsCagr, 0, gT) : clamp_(avgRange(1, 10), 0, gT);
+    gD = Math.min(gD, r - 0.02);
     M['Dividend discount'] = div / shares * (1 + gD) / (r - gD);
   }
   if (equity && equity > 0 && ni !== null) {
     var roe = ni / equity;
-    if (roe > gT) M['Justified P/B'] = equity / shares * (roe - gT) / (r - gT);
+    if (roe > gT && roe <= 0.35) M['Justified P/B'] = equity / shares * (roe - gT) / (r - gT);
   }
   if (type === 'Financial' && eps !== null && eps > 0) {
     out.target5 = eps * Math.pow(1 + mean_(path.slice(0, 5)), 5) * exitMultiple_(avgRange(6, 10), S.peCap);

@@ -217,7 +217,10 @@ async function ukRow(ticker) {
       .forEach(f => {
         let v = ukVal(latest, f); if (v === '' && useT) v = ukVal(fy0, f);
         row[f + ' TTM'] = v;
-        row[f + ' TTM 1y ago'] = ukVal(prev, f);
+        let p = ukVal(prev, f);
+        if (p === '' && useT) p = ukVal(fy0, f);    // no trailing record a year back: compare with last annual report
+        if (p === '' && !useT) p = ukVal(fy1, f);
+        row[f + ' TTM 1y ago'] = p;
       });
     row['EPS TTM'] = ukVal(latest, 'EPS'); row['EPS TTM 1y ago'] = ukVal(prev, 'EPS');
     row['Diluted shares latest'] = ukVal(latest, 'DilutedShares') || ukVal(fy0, 'DilutedShares');
