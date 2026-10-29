@@ -135,6 +135,7 @@ async function main() {
     console.log(`${t.ticker.padEnd(6)} ${row.Status}`);
   }
 
+  await addYahoo(rows, tickers);
   await addEstimates(rows);
 
   fs.mkdirSync(OUT_DIR, { recursive: true });
@@ -157,6 +158,45 @@ async function main() {
   console.log(`\nWrote ${rows.length} rows (${ok} OK) to raw_data.csv`);
 }
 
+// Analyst targets and current/next fiscal-year estimates from Yahoo Finance (unofficial, via the
+// yahoo-finance2 package). Covers nearly all US and UK listings; FMP fills any gaps.
+async function addYahoo(rows, tickers) {
+  let yf;
+  try {
+    const mod = await import('yahoo-finance2');
+    const YF = mod.default;
+    yf = typeof YF === 'function' ? new YF({ suppressNotices: ['yahooSurvey'] }) : YF;
+  } catch (e) { console.log('Yahoo library not available: ' + e.message); return; }
+  const market = {};
+  tickers.forEach(t => { market[t.ticker] = t.market; });
+  let ok = 0, fail = 0;
+  for (const r of rows) {
+    const m = market[r.Ticker] || 'US';
+    if (m === 'ETF') continue;
+    const sym = m === 'UK' ? r.Ticker.replace(/\.$/, '') + '.L' : r.Ticker.replace(/\./g, '-');
+    try {
+      const q = await yf.quoteSummary(sym, { modules: ['financialData', 'earningsTrend'] }, { validateResult: false });
+      const fd = q.financialData || {}, tr = (q.earningsTrend && q.earningsTrend.trend) || [];
+      const y0 = tr.find(t => t.period === '0y') || {}, y1 = tr.find(t => t.period === '+1y') || {};
+      const d = x => (x ? new Date(x).toISOString().slice(0, 10) : '');
+      if (fd.targetMeanPrice) {
+        r['Target consensus'] = fd.targetMeanPrice; r['Target high'] = fd.targetHighPrice || ''; r['Target low'] = fd.targetLowPrice || '';
+        r['Est analysts'] = fd.numberOfAnalystOpinions || '';
+      }
+      const rev1 = y1.revenueEstimate && y1.revenueEstimate.avg;
+      if (rev1 > 0) {
+        r['Est FY1 end'] = d(y0.endDate); r['Est FY2 end'] = d(y1.endDate);
+        r['Est revenue FY1'] = (y0.revenueEstimate && y0.revenueEstimate.avg) || ''; r['Est revenue FY2'] = rev1;
+        r['Est EPS FY1'] = (y0.earningsEstimate && y0.earningsEstimate.avg) ?? ''; r['Est EPS FY2'] = (y1.earningsEstimate && y1.earningsEstimate.avg) ?? '';
+        r['Est source'] = 'Yahoo';
+      }
+      ok++;
+    } catch (e) { fail++; }
+    await sleep(400);
+  }
+  console.log(`Yahoo: ${ok} answered, ${fail} failed`);
+}
+
 // Analyst estimates and price targets from Financial Modeling Prep (free key, limited coverage).
 // Covered tickers are re-checked weekly (Sundays) or when the coverage list is missing,
 // so daily calls stay well inside the free 250/day limit.
@@ -172,6 +212,7 @@ async function addEstimates(rows) {
   const status = [];
   let calls = 0;
   for (const r of us) {
+    if (r['Est revenue FY2'] && r['Target consensus']) continue;           // Yahoo already supplied it
     if (covered && !covered.has(r.Ticker)) { status.push(`${r.Ticker},402`); continue; }
     if (calls > 230) { status.push(`${r.Ticker},skipped`); continue; }
     try {
@@ -182,15 +223,15 @@ async function addEstimates(rows) {
       const est = (await res.json()).sort((a, b) => (a.date < b.date ? -1 : 1));
       const fy0 = Date.parse(r['Latest FY end']);
       const fwd = est.filter(e => Date.parse(e.date) > fy0 + 20 * 864e5);
-      if (fwd.length >= 2) {
-        r['Est FY1 end'] = fwd[0].date;
+      if (fwd.length >= 2 && !r['Est revenue FY2']) {
+        r['Est FY1 end'] = fwd[0].date; r['Est FY2 end'] = fwd[1].date; r['Est source'] = 'FMP';
         r['Est revenue FY1'] = fwd[0].revenueAvg; r['Est revenue FY2'] = fwd[1].revenueAvg;
         r['Est EPS FY1'] = fwd[0].epsAvg; r['Est EPS FY2'] = fwd[1].epsAvg;
         r['Est analysts'] = fwd[0].numAnalystsRevenue || '';
       }
       const t = await fetch(`https://financialmodelingprep.com/stable/price-target-consensus?symbol=${r.Ticker}&apikey=${KEY}`);
       calls++;
-      if (t.status === 200) {
+      if (t.status === 200 && !r['Target consensus']) {
         const p = (await t.json())[0] || {};
         r['Target consensus'] = p.targetConsensus || ''; r['Target high'] = p.targetHigh || ''; r['Target low'] = p.targetLow || '';
       }

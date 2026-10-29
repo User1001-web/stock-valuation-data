@@ -18,7 +18,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
+      - name: Install Yahoo Finance library
+        run: npm install --no-save yahoo-finance2@4.0.5
       - name: Pull SEC data
         run: node fetch_sec.js
         env:

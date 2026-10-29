@@ -136,7 +136,7 @@ var RAW_COLS = (function () {
   });
   c.push('Notes');
   c.push('Est FY1 end', 'Est revenue FY1', 'Est revenue FY2', 'Est EPS FY1', 'Est EPS FY2', 'Est analysts',
-    'Target consensus', 'Target high', 'Target low');
+    'Target consensus', 'Target high', 'Target low', 'Est FY2 end', 'Est source');
   return c;
 })();
 
@@ -916,6 +916,8 @@ var MODELS_BY_TYPE = {
  */
 function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var out = { models: {}, notes: [], signals: {} };
+  out.analystTarget = n_(raw['Target consensus']);
+  out.analysts = n_(raw['Est analysts']);
   var status = String(raw.Status || '');
   out.dataDate = raw['Latest period end'] || '';
   if (!raw.CIK || /^(Skipped|No SEC|SEC has no|Error|Waiting)/.test(status)) {
@@ -975,10 +977,13 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var ovG = n_(ovr.growth);
   var estRev2 = F('Est revenue FY2'), estEps2 = n_(raw['Est EPS FY2']);
   var consensus = estRev2 !== null && estRev2 > 0 && r0 !== null && r0 > 0;
+  var fy0End = raw['Latest FY end'], fy2End = raw['Est FY2 end'] || '';
+  var estYears = fy0End && fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - dnum_(String(fy0End).slice(0, 10))) / 365.25, 1, 3.5) : 2;
+  var yearsAhead = fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - today) / 365.25, 0.5, 3) : 2;
   if (ovG !== null) { g0 = ovG > 1.5 ? ovG / 100 : ovG; basis = 'Override'; }
   else if (consensus) {
-    g0 = Math.sqrt(estRev2 / r0) - 1;
-    basis = 'Analyst consensus: 2-yr revenue growth (' + (n_(raw['Est analysts']) || '?') + ' analysts)';
+    g0 = Math.pow(estRev2 / r0, 1 / estYears) - 1;
+    basis = 'Analyst consensus revenue growth (' + (n_(raw['Est analysts']) || '?') + ' analysts, ' + (raw['Est source'] || 'estimates') + ')';
   } else {
     var avg = mean_([yoy, cagr3]);
     g0 = avg === null ? S.gTerm : avg;
@@ -1027,7 +1032,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var cyclicalSic = (sic >= 1000 && sic <= 1499) || (sic >= 2800 && sic <= 2999) || (sic >= 3300 && sic <= 3399) ||
     (sic >= 3670 && sic <= 3679) || (sic >= 3711 && sic <= 3716) || (sic >= 4400 && sic <= 4499);
   var established = (fy('Revenue', 3) || 0) >= 5e9;
-  var peak = cyclicalSic && established && !consensus && ovG === null && ovM === null && yoy !== null && yoy > 0.5 && netMarginNow !== null &&
+  var peak = cyclicalSic && established && ovG === null && ovM === null && yoy !== null && yoy > 0.5 && netMarginNow !== null &&
     lastYear !== null && netMarginNow > 0 && netMarginNow > 2 * Math.max(lastYear, 0.02);
   out.cyclicalPeak = peak;
   var fcfBase = fcf, epsBase = eps;
@@ -1035,9 +1040,8 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     var cycNet = mean_([netMarginNow].concat(prevNet)), cycFcf = mean_([fcfMarginNow, fcfMarginAvg]);
     mN = Math.max(cycNet, 0.01); mF = Math.max(cycFcf || cycNet, 0.01);
     fcfBase = rev * mF; epsBase = rev * mN / shares;
-    g0 = gT; path = growthPath_(g0, gT); out.g0 = g0;
-    out.gBasis = 'Cyclical peak: no growth assumed';
-    out.notes.push('Possible cyclical peak: average-cycle margins and no growth used (override on Tickers to change)');
+    if (!consensus) { g0 = gT; path = growthPath_(g0, gT); out.g0 = g0; out.gBasis = 'Cyclical peak: no growth assumed'; }
+    out.notes.push('Possible cyclical peak: average-cycle margins used' + (consensus ? '' : ' and no growth') + ' (override on Tickers to change)');
   }
 
   // Dilution (ignores share-count jumps that look like splits)
@@ -1060,9 +1064,11 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     out.target5 = p5.target;
   }
   if (epsBase !== null && epsBase > 0) {
-    var eps2 = consensus && estEps2 !== null && estEps2 > 0 ? estEps2 * fx : epsBase * (1 + path[0]) * (1 + path[1]);
-    if (consensus && estEps2 > 0) out.notes.push('Fwd EPS x P/E uses consensus EPS (analysts often use adjusted EPS)');
-    M['Fwd EPS x P/E'] = eps2 * exitMultiple_(avgRange(3, 7), S.peCap) / Math.pow(1 + S.req, 2);
+    var useEstEps = consensus && !peak && estEps2 !== null && estEps2 > 0;
+    var eps2 = useEstEps ? estEps2 * fx : epsBase * (1 + path[0]) * (1 + path[1]);
+    if (useEstEps) out.notes.push('Fwd EPS x P/E uses consensus EPS (analysts often use adjusted EPS)');
+    var epsYears = useEstEps ? yearsAhead : 2;
+    M['Fwd EPS x P/E'] = eps2 * exitMultiple_(avgRange(3, 7), S.peCap) / Math.pow(1 + S.req, epsYears);
     var gG = Math.min(avgRange(1, 10) * 100, 15);
     if (S.aaa > 0) M['Graham'] = epsBase * (8.5 + 2 * gG) * 4.4 / (S.aaa * 100);
     var gL = Math.min(avgRange(1, 5) * 100, 25);
@@ -1110,9 +1116,6 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     }
     if (sol) { out.implied = sol.g; out.impliedNote = sol.note; }
   }
-
-  out.analystTarget = n_(raw['Target consensus']);
-  out.analysts = n_(raw['Est analysts']);
 
   // Metrics
   out.divYield = price && div ? div / (price * shares) : 0;
