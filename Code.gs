@@ -135,6 +135,8 @@ var RAW_COLS = (function () {
     for (var i = 0; i <= 5; i++) c.push(f + ' FY' + (i === 0 ? '0' : '-' + i));
   });
   c.push('Notes');
+  c.push('Est FY1 end', 'Est revenue FY1', 'Est revenue FY2', 'Est EPS FY1', 'Est EPS FY2', 'Est analysts',
+    'Target consensus', 'Target high', 'Target low');
   return c;
 })();
 
@@ -346,6 +348,7 @@ function refreshFundamentals() {
     var result = buildRawRows(csv, tickers.map(function (t) { return t.ticker; }));
 
     var sh = SpreadsheetApp.getActive().getSheetByName(SHEET.RAW);
+    sh.getRange(1, 1, 1, RAW_COLS.length).setValues([RAW_COLS]).setFontWeight('bold');
     if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).clearContent();
     if (result.rows.length) sh.getRange(2, 1, result.rows.length, RAW_COLS.length).setValues(result.rows);
     loadRates_(url);
@@ -970,8 +973,13 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   // Starting growth, path and discount rate
   var g0, basis;
   var ovG = n_(ovr.growth);
+  var estRev2 = F('Est revenue FY2'), estEps2 = n_(raw['Est EPS FY2']);
+  var consensus = estRev2 !== null && estRev2 > 0 && r0 !== null && r0 > 0;
   if (ovG !== null) { g0 = ovG > 1.5 ? ovG / 100 : ovG; basis = 'Override'; }
-  else {
+  else if (consensus) {
+    g0 = Math.sqrt(estRev2 / r0) - 1;
+    basis = 'Analyst consensus: 2-yr revenue growth (' + (n_(raw['Est analysts']) || '?') + ' analysts)';
+  } else {
     var avg = mean_([yoy, cagr3]);
     g0 = avg === null ? S.gTerm : avg;
     basis = yoy !== null && cagr3 !== null ? 'Avg of 1-yr and 3-yr revenue growth' : yoy !== null ? '1-yr revenue growth' : cagr3 !== null ? '3-yr revenue growth' : 'No history (terminal rate)';
@@ -1019,7 +1027,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var cyclicalSic = (sic >= 1000 && sic <= 1499) || (sic >= 2800 && sic <= 2999) || (sic >= 3300 && sic <= 3399) ||
     (sic >= 3670 && sic <= 3679) || (sic >= 3711 && sic <= 3716) || (sic >= 4400 && sic <= 4499);
   var established = (fy('Revenue', 3) || 0) >= 5e9;
-  var peak = cyclicalSic && established && ovG === null && ovM === null && yoy !== null && yoy > 0.5 && netMarginNow !== null &&
+  var peak = cyclicalSic && established && !consensus && ovG === null && ovM === null && yoy !== null && yoy > 0.5 && netMarginNow !== null &&
     lastYear !== null && netMarginNow > 0 && netMarginNow > 2 * Math.max(lastYear, 0.02);
   out.cyclicalPeak = peak;
   var fcfBase = fcf, epsBase = eps;
@@ -1052,7 +1060,8 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     out.target5 = p5.target;
   }
   if (epsBase !== null && epsBase > 0) {
-    var eps2 = epsBase * (1 + path[0]) * (1 + path[1]);
+    var eps2 = consensus && estEps2 !== null && estEps2 > 0 ? estEps2 * fx : epsBase * (1 + path[0]) * (1 + path[1]);
+    if (consensus && estEps2 > 0) out.notes.push('Fwd EPS x P/E uses consensus EPS (analysts often use adjusted EPS)');
     M['Fwd EPS x P/E'] = eps2 * exitMultiple_(avgRange(3, 7), S.peCap) / Math.pow(1 + S.req, 2);
     var gG = Math.min(avgRange(1, 10) * 100, 15);
     if (S.aaa > 0) M['Graham'] = epsBase * (8.5 + 2 * gG) * 4.4 / (S.aaa * 100);
@@ -1101,6 +1110,9 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     }
     if (sol) { out.implied = sol.g; out.impliedNote = sol.note; }
   }
+
+  out.analystTarget = n_(raw['Target consensus']);
+  out.analysts = n_(raw['Est analysts']);
 
   // Metrics
   out.divYield = price && div ? div / (price * shares) : 0;
@@ -1168,7 +1180,9 @@ var CALC_COLS = [
   ['FCF margin', '0.0%;[Red]-0.0%', 'fcfMargin'], ['ROIC', '0.0%;[Red]-0.0%', 'roic'],
   ['Net cash (m)', '#,##0;[Red]-#,##0', 'netCashM'], ['EV / sales', '0.0', 'evSales'], ['P/E (TTM)', '0.0', 'pe'],
   ['Cash runway (months)', '0', 'runway'], ['Dilution 1-yr', '0.0%;[Red]-0.0%', 'dilution'],
-  ['Data as of', '@', 'dataDate'], ['Notes', '@', 'notesText'], ['Sort key', '0.000', 'F:sort']
+  ['Data as of', '@', 'dataDate'], ['Notes', '@', 'notesText'],
+  ['Analyst target', '#,##0.00', 'analystTarget'], ['Analyst target upside', '0.0%;[Red]-0.0%', 'F:tupside'],
+  ['Analysts', '0', 'analysts'], ['Sort key', '0.000', 'F:sort']
 ];
 function calcIdx_(header) { for (var i = 0; i < CALC_COLS.length; i++) if (CALC_COLS[i][0] === header) return i + 1; throw new Error(header); }
 function calcL_(header) { return colL_(calcIdx_(header)); }
@@ -1189,6 +1203,7 @@ function calcFormula_(key, r) {
     case 'signal':
       var D = c('Type'), Q = c('Direction %'), U = c('Models used');
       return '=IF(' + D + '="Pre-profit","Speculative",IF(OR(' + G + '="",' + P + '=""),"No valuation",IF(AND(' + P + '<=' + J + ',N(' + Q + ')>=0.6,N(' + U + ')>=3),"Buy zone",IF(AND(' + P + '<=' + J + ',N(' + Q + ')<=0.4),"Value trap?",IF(' + P + '<=' + J + '*1.1,"Approaching","Wait")))))';
+    case 'tupside': var AT = c('Analyst target'); return '=IF(OR(' + AT + '="",' + P + '="",' + P + '=0),"",' + AT + '/' + P + '-1)';
     case 'sort': return '=IF(' + c('Upside') + '="",-99,' + c('Upside') + ')';
   }
 }
@@ -1369,7 +1384,7 @@ function ensureSettings_() {
 /** Holdings: valuation columns to the right of the existing ones. */
 function writeHoldingsValuation_() {
   var sh = SpreadsheetApp.getActive().getSheetByName(SHEET.HOLDINGS);
-  var heads = ['Type', 'Fair value (local)', 'Low', 'High', 'Upside', 'Exp. 5-yr return', 'Direction', 'Status', 'Review'];
+  var heads = ['Type', 'Fair value (local)', 'Low', 'High', 'Upside', 'Exp. 5-yr return', 'Direction', 'Status', 'Review', 'Analyst target'];
   sh.getRange(1, 14, 1, heads.length).setValues([heads]).setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#1F3A5F').setWrap(true);
   var last = colL_(CALC_COLS.length);
   var look = function (h) { return 'IFERROR(VLOOKUP(A2:A,Calc!$A:$' + last + ',' + calcIdx_(h) + ',FALSE),"")'; };
@@ -1378,6 +1393,8 @@ function writeHoldingsValuation_() {
     S2: look('Exp. 5-yr return (a year)'), T2: look('Direction'), U2: look('Status')
   };
   Object.keys(f).forEach(function (a1) { sh.getRange(a1).setFormula('=ARRAYFORMULA(IF(A2:A="",,' + f[a1] + '))'); });
+  sh.getRange('W2').setFormula('=ARRAYFORMULA(IF(A2:A="",,' + look('Analyst target') + '))');
+  sh.getRange('W2:W500').setNumberFormat('#,##0.00');
   sh.getRange('V2').setFormula('=ARRAYFORMULA(IF(A2:A="",,TRIM(IF(N(M2:M)>0.15,"Over 15% of portfolio. ","")&IF(N(' +
     look('Direction change (3 months)') + ')<=-2,"Direction score fell 2+ in 3 months.",""))))');
   var fmt = { O: '#,##0.00', P: '#,##0.00', Q: '#,##0.00', R: '0.0%;[Red]-0.0%', S: '0.0%;[Red]-0.0%' };
@@ -1388,16 +1405,16 @@ function writeHoldingsValuation_() {
 /** Watchlist: watched (not held) stocks, best upside first. */
 function writeWatchlist_() {
   var heads = ['Ticker', 'Name', 'Type', 'Price', 'Currency', 'Fair value', 'Buy below', 'Upside', 'Exp. 5-yr return',
-    'Direction', 'Signal', 'Implied growth', 'Cash runway (months)', 'Dilution 1-yr', 'Notes'];
+    'Direction', 'Signal', 'Implied growth', 'Cash runway (months)', 'Dilution 1-yr', 'Notes', 'Analyst target'];
   var sh = ensureSheet_(SHEET2.WATCH, heads);
   sh.getRange(1, 1, 1, heads.length).setFontColor('#FFFFFF').setBackground('#1F3A5F').setWrap(true);
   var cols = ['Ticker', 'Name', 'Type', 'Price', 'Currency', 'Fair value', 'Buy below', 'Upside', 'Exp. 5-yr return (a year)',
-    'Direction', 'Watch signal', 'Implied growth (reverse DCF)', 'Cash runway (months)', 'Dilution 1-yr', 'Notes'];
+    'Direction', 'Watch signal', 'Implied growth (reverse DCF)', 'Cash runway (months)', 'Dilution 1-yr', 'Notes', 'Analyst target'];
   var arr = '{' + cols.map(function (h) { return 'Calc!' + calcL_(h) + '2:' + calcL_(h); }).join(',') + '}';
   var cond = 'Calc!C2:C="Watchlist"';
   sh.getRange('A2').setFormula('=IFERROR(SORT(FILTER(' + arr + ',' + cond + '),FILTER(Calc!' + calcL_('Sort key') + '2:' +
     calcL_('Sort key') + ',' + cond + '),FALSE),"Run Valuation ▸ Recalculate valuations")');
-  var fmt = { D: '#,##0.00', F: '#,##0.00', G: '#,##0.00', H: '0.0%;[Red]-0.0%', I: '0.0%;[Red]-0.0%', L: '0.0%', M: '0', N: '0.0%;[Red]-0.0%' };
+  var fmt = { D: '#,##0.00', F: '#,##0.00', G: '#,##0.00', H: '0.0%;[Red]-0.0%', I: '0.0%;[Red]-0.0%', L: '0.0%', M: '0', N: '0.0%;[Red]-0.0%', P: '#,##0.00' };
   Object.keys(fmt).forEach(function (c) { sh.getRange(c + '2:' + c + '500').setNumberFormat(fmt[c]); });
   sh.setColumnWidth(2, 200); sh.setColumnWidth(15, 360);
 }

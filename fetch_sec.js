@@ -135,6 +135,8 @@ async function main() {
     console.log(`${t.ticker.padEnd(6)} ${row.Status}`);
   }
 
+  await addEstimates(rows);
+
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const lines = [RAW_COLS.map(csvCell).join(',')]
     .concat(rows.map(r => RAW_COLS.map(c => csvCell(r[c])).join(',')));
@@ -153,6 +155,51 @@ async function main() {
   if (rates.length > 1) fs.writeFileSync(path.join(OUT_DIR, 'rates.csv'), rates.join('\n') + '\n');
   const ok = rows.filter(r => r.Status === 'OK').length;
   console.log(`\nWrote ${rows.length} rows (${ok} OK) to raw_data.csv`);
+}
+
+// Analyst estimates and price targets from Financial Modeling Prep (free key, limited coverage).
+// Covered tickers are re-checked weekly (Sundays) or when the coverage list is missing,
+// so daily calls stay well inside the free 250/day limit.
+async function addEstimates(rows) {
+  const KEY = (process.env.FMP_KEY || '').trim();
+  if (!KEY) { console.log('No FMP_KEY secret: skipping analyst estimates'); return; }
+  const covFile = path.join(OUT_DIR, 'fmp_coverage.csv');
+  const us = rows.filter(r => r.CIK && r['Latest FY end']);
+  let covered = null;
+  if (fs.existsSync(covFile) && new Date().getUTCDay() !== 0) {
+    covered = new Set(fs.readFileSync(covFile, 'utf8').split('\n').slice(1).filter(l => l.endsWith(',200')).map(l => l.split(',')[0]));
+  }
+  const status = [];
+  let calls = 0;
+  for (const r of us) {
+    if (covered && !covered.has(r.Ticker)) { status.push(`${r.Ticker},402`); continue; }
+    if (calls > 230) { status.push(`${r.Ticker},skipped`); continue; }
+    try {
+      const res = await fetch(`https://financialmodelingprep.com/stable/analyst-estimates?symbol=${r.Ticker}&period=annual&page=0&limit=10&apikey=${KEY}`);
+      calls++;
+      status.push(`${r.Ticker},${res.status}`);
+      if (res.status !== 200) continue;
+      const est = (await res.json()).sort((a, b) => (a.date < b.date ? -1 : 1));
+      const fy0 = Date.parse(r['Latest FY end']);
+      const fwd = est.filter(e => Date.parse(e.date) > fy0 + 20 * 864e5);
+      if (fwd.length >= 2) {
+        r['Est FY1 end'] = fwd[0].date;
+        r['Est revenue FY1'] = fwd[0].revenueAvg; r['Est revenue FY2'] = fwd[1].revenueAvg;
+        r['Est EPS FY1'] = fwd[0].epsAvg; r['Est EPS FY2'] = fwd[1].epsAvg;
+        r['Est analysts'] = fwd[0].numAnalystsRevenue || '';
+      }
+      const t = await fetch(`https://financialmodelingprep.com/stable/price-target-consensus?symbol=${r.Ticker}&apikey=${KEY}`);
+      calls++;
+      if (t.status === 200) {
+        const p = (await t.json())[0] || {};
+        r['Target consensus'] = p.targetConsensus || ''; r['Target high'] = p.targetHigh || ''; r['Target low'] = p.targetLow || '';
+      }
+    } catch (e) { status.push(`${r.Ticker},error`); }
+    await sleep(200);
+  }
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  fs.writeFileSync(covFile, 'ticker,status\n' + status.join('\n') + '\n');
+  console.log(`Analyst estimates: ${rows.filter(r => r['Est revenue FY2']).length} tickers (${calls} FMP calls)`);
 }
 
 main().catch(err => { console.error('FAILED: ' + err.message); process.exit(1); });
