@@ -136,7 +136,7 @@ var RAW_COLS = (function () {
   });
   c.push('Notes');
   c.push('Est FY1 end', 'Est revenue FY1', 'Est revenue FY2', 'Est EPS FY1', 'Est EPS FY2', 'Est analysts',
-    'Target consensus', 'Target high', 'Target low', 'Est FY2 end', 'Est source', 'Sector');
+    'Target consensus', 'Target high', 'Target low', 'Est FY2 end', 'Est source', 'Sector', 'Yahoo price');
   return c;
 })();
 
@@ -879,9 +879,9 @@ function dcfPerShare_(fcf0, g0, gT, r, netCash, shares) {
 }
 
 /** Revenue-based 5-year projection: revenue x margin x exit multiple, per future share, discounted. */
-function projection5_(rev0, g0, gT, margin, mult, shares, dil, req) {
+function projection5_(rev0, g0, gT, margin, mult, shares, dil, req, years) {
   var path = growthPath_(g0, gT);
-  var rev5 = grow_(rev0, path, 5);
+  var rev5 = grow_(rev0, path, years === undefined ? 5 : years);
   var sh5 = shares * Math.pow(1 + dil, 5);
   var target = rev5 * margin * mult / sh5;
   return { fv: target / Math.pow(1 + req, 5), target: target };
@@ -933,6 +933,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
 
   var F = function (k) { var v = n_(raw[k]); return v === null ? null : v * fx; };
   var price = n_(mkt.price);
+  if (price === null) price = n_(raw['Yahoo price']);
   var shares = n_(raw['Diluted shares latest']);
   var gShares = n_(mkt.shares);
   if (!shares && gShares) { shares = gShares; out.notes.push('Share count from Google Finance'); }
@@ -967,7 +968,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var ovType = String(ovr.type || '').trim();
   if (ovType && MODELS_BY_TYPE[ovType]) { type = ovType; out.notes.push('Type set by override'); }
   else if (((sic >= 6000 && sic <= 6299) || sic === 6726) && !(rev && capex / rev > 0.1)) type = 'Financial';
-  else if (raw.CIK === 'LSE' && (!raw.Sector || raw.Sector === 'Financial Services' || raw.Sector === 'Real Estate')) type = 'Financial';
+  else if ((raw.CIK === 'LSE' && !raw.Sector) || ((raw.CIK === 'LSE' || raw.CIK === 'YAHOO') && (raw.Sector === 'Financial Services' || raw.Sector === 'Real Estate'))) type = 'Financial';
   else if (ni === null || ni <= 0) type = 'Pre-profit';
   else if ((mean_([yoy, cagr3]) || 0) >= S.growthThreshold) type = 'Growth';
   else type = 'Mature';
@@ -1054,13 +1055,19 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var allowed = MODELS_BY_TYPE[type];
   var M = {};
   var hasRev = rev !== null && rev >= 25e6;
+  // Pre-revenue: start the revenue projection from analysts' forecast instead (speculative).
+  var projRev = rev, projYears = 5;
+  if (!hasRev && consensus && estRev2 >= 25e6) {
+    projRev = estRev2; projYears = Math.max(1, Math.round(5 - yearsAhead)); hasRev = true;
+    out.notes.push('Pre-revenue: valued from analysts\' revenue forecast');
+  }
   var peLater = exitMultiple_(avgRange(6, 10), S.peCap);
   var pfLater = exitMultiple_(avgRange(6, 10), S.pfcfCap);
 
   if (fcfBase !== null && fcfBase > 0 && type !== 'Financial') M['DCF'] = dcfPerShare_(fcfBase, g0, gT, r, netCash, shares);
   if (hasRev && type !== 'Financial') {
-    M['FCF future market cap'] = projection5_(rev, g0, gT, mF, pfLater, shares, dilP, S.req).fv;
-    var p5 = projection5_(rev, g0, gT, mN, peLater, shares, dilP, S.req);
+    M['FCF future market cap'] = projection5_(projRev, g0, gT, mF, pfLater, shares, dilP, S.req, projYears).fv;
+    var p5 = projection5_(projRev, g0, gT, mN, peLater, shares, dilP, S.req, projYears);
     M['5-yr earnings'] = p5.fv;
     out.target5 = p5.target;
   }
@@ -1104,6 +1111,13 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     if (v <= 0 || (price && (v < 0.2 * price || v > 5 * price))) { excluded.push(name); return; }
     used.push(name);
   });
+  if (!used.length && excluded.length) {
+    var pos = excluded.filter(function (k) { return M[k] > 0; });
+    if (pos.length) {
+      used = pos; excluded = [];
+      out.notes.push('Caution: every model is far from the share price (below 20% or above 5x); shown anyway');
+    }
+  }
   var vals = used.map(function (k) { return M[k]; });
   if (vals.length) {
     out.fv = median_(vals); out.low = Math.min.apply(null, vals); out.high = Math.max.apply(null, vals);
@@ -1120,7 +1134,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
       sol = solveGrowth_(function (g) { return dcfPerShare_(fcfBase, g, gT, r, netCash, shares); }, price);
       out.impliedBasis = 'DCF';
     } else if (hasRev && type !== 'Financial') {
-      sol = solveGrowth_(function (g) { return projection5_(rev, g, gT, mF, pfLater, shares, dilP, S.req).fv; }, price);
+      sol = solveGrowth_(function (g) { return projection5_(projRev, g, gT, mF, pfLater, shares, dilP, S.req, projYears).fv; }, price);
       out.impliedBasis = 'Revenue projection';
     }
     if (sol) { out.implied = sol.g; out.impliedNote = sol.note; }
@@ -1203,7 +1217,9 @@ function calcFormula_(key, r) {
   var c = function (h) { return calcL_(h) + r; };
   var P = c('Price'), G = c('Fair value'), H = c('High'), J = c('Buy below');
   switch (key) {
-    case 'price': return '=IFERROR(VLOOKUP($A' + r + ',Market!$A:$D,4,FALSE),"")';
+    case 'price':
+      var yIdx = RAW_COLS.indexOf('Yahoo price') + 1, rawLast = colL_(RAW_COLS.length);
+      return '=IF(N(IFERROR(VLOOKUP($A' + r + ',Market!$A:$D,4,FALSE),0))>0,VLOOKUP($A' + r + ',Market!$A:$D,4,FALSE),IFERROR(1/(1/VLOOKUP($A' + r + ',\'Raw Data\'!$A:$' + rawLast + ',' + yIdx + ',FALSE)),""))';
     case 'upside': return '=IF(OR(' + G + '="",' + P + '="",' + P + '=0),"",' + G + '/' + P + '-1)';
     case 'pfv': return '=IF(OR(' + G + '="",' + P + '=""),"",' + P + '/' + G + ')';
     case 'expret':

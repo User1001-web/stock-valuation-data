@@ -130,6 +130,11 @@ async function main() {
       if (err.blocked) throw err;
       row = { Ticker: t.ticker, Status: 'Error: ' + err.message };
     }
+    const staleDays = row['Latest period end'] ? (Date.now() - Date.parse(row['Latest period end'])) / 864e5 : 0;
+    if (t.market === 'US' && (/^(No SEC filer|SEC has no)/.test(row.Status || '') || staleDays > 456)) {
+      const y = await yahooRow(t.ticker, t.ticker.replace(/\./g, '-'), 'YAHOO');
+      if (y.Status === 'OK' || /^Partial/.test(y.Status || '')) { y.Notes = (y.Notes || '') + ' (SEC data missing or out of date)'; row = y; }
+    }
     row.Updated = stamp;
     rows.push(row);
     console.log(`${t.ticker.padEnd(6)} ${row.Status}`);
@@ -184,10 +189,10 @@ function ukVal(rec, field) {
   return '';
 }
 const isoOf = d => (typeof d === 'number' ? new Date(d * (d < 1e11 ? 1000 : 1)) : new Date(d)).toISOString().slice(0, 10);
-async function ukRow(ticker) {
-  const sym = ticker + '.L';
+async function ukRow(ticker) { return yahooRow(ticker, ticker + '.L', 'LSE'); }
+async function yahooRow(ticker, sym, idTag) {
   const yf = await yahoo();
-  const row = { Ticker: ticker, CIK: 'LSE', 'Filer form': 'Yahoo Finance (LSE)', Accounting: 'IFRS' };
+  const row = { Ticker: ticker, CIK: idTag, 'Filer form': idTag === 'LSE' ? 'Yahoo Finance (LSE)' : 'Yahoo Finance', Accounting: idTag === 'LSE' ? 'IFRS' : '' };
   try {
     const annual = (await yf.fundamentalsTimeSeries(sym, { period1: '2019-01-01', type: 'annual', module: 'all' }, { validateResult: false }))
       .map(r => Object.assign({}, r, { iso: isoOf(r.date) })).sort((a, b) => (a.iso < b.iso ? 1 : -1));
@@ -197,7 +202,7 @@ async function ukRow(ticker) {
     await sleep(300);
     const qs = await yf.quoteSummary(sym, { modules: ['assetProfile', 'price', 'financialData'] }, { validateResult: false });
     await sleep(300);
-    if (!annual.length) return { Ticker: ticker, Status: 'No UK financial data on Yahoo Finance' };
+    if (!annual.length) return { Ticker: ticker, Status: idTag === 'LSE' ? 'No UK financial data on Yahoo Finance' : 'No SEC or Yahoo financial data' };
     row['SEC name'] = (qs.price && qs.price.longName) || '';
     row.Industry = (qs.assetProfile && qs.assetProfile.industry) || '';
     row.Sector = (qs.assetProfile && qs.assetProfile.sector) || '';
@@ -237,9 +242,9 @@ async function ukRow(ticker) {
     const need = ['NetIncome TTM', 'Diluted shares latest', 'Equity'];
     const missing = need.filter(k => row[k] === '' || row[k] === undefined);
     row.Status = missing.length ? 'Partial: missing ' + missing.join(', ') : 'OK';
-    row.Notes = 'UK figures from Yahoo Finance' + (useT ? ' (trailing 12 months incl. half-year results)' : ' (annual)');
+    row.Notes = (idTag === 'LSE' ? 'UK figures' : 'Figures') + ' from Yahoo Finance' + (useT ? ' (trailing 12 months incl. half-year results)' : ' (annual)');
   } catch (e) {
-    return { Ticker: ticker, Status: 'Error: UK data ' + String(e.message).slice(0, 120) };
+    return { Ticker: ticker, Status: 'Error: Yahoo data ' + String(e.message).slice(0, 120) };
   }
   return row;
 }
@@ -261,6 +266,7 @@ async function addYahoo(rows, tickers) {
       const fd = q.financialData || {}, tr = (q.earningsTrend && q.earningsTrend.trend) || [];
       const y0 = tr.find(t => t.period === '0y') || {}, y1 = tr.find(t => t.period === '+1y') || {};
       const d = x => (x ? new Date(x).toISOString().slice(0, 10) : '');
+      if (fd.currentPrice) r['Yahoo price'] = fd.currentPrice;
       if (fd.targetMeanPrice) {
         r['Target consensus'] = fd.targetMeanPrice; r['Target high'] = fd.targetHighPrice || ''; r['Target low'] = fd.targetLowPrice || '';
         r['Est analysts'] = fd.numberOfAnalystOpinions || '';
