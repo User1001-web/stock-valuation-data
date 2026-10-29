@@ -205,6 +205,7 @@ async function yahooRow(ticker, sym, idTag) {
     if (!annual.length) return { Ticker: ticker, Status: idTag === 'LSE' ? 'No UK financial data on Yahoo Finance' : 'No SEC or Yahoo financial data' };
     row['SEC name'] = (qs.price && qs.price.longName) || '';
     row.Industry = (qs.assetProfile && qs.assetProfile.industry) || '';
+    row['Yahoo industry'] = row.Industry;
     row.Sector = (qs.assetProfile && qs.assetProfile.sector) || '';
     row.Currency = (qs.financialData && qs.financialData.financialCurrency) || 'GBP';
 
@@ -262,8 +263,11 @@ async function addYahoo(rows, tickers) {
     if (m === 'ETF') continue;
     const sym = m === 'UK' ? r.Ticker.replace(/\.$/, '') + '.L' : r.Ticker.replace(/\./g, '-');
     try {
-      const q = await yf.quoteSummary(sym, { modules: ['financialData', 'earningsTrend'] }, { validateResult: false });
+      const q = await yf.quoteSummary(sym, { modules: ['financialData', 'earningsTrend', 'assetProfile'] }, { validateResult: false });
       const fd = q.financialData || {}, tr = (q.earningsTrend && q.earningsTrend.trend) || [];
+      const ap = q.assetProfile || {};
+      if (ap.sector) r.Sector = ap.sector;
+      if (ap.industry) r['Yahoo industry'] = ap.industry;
       const y0 = tr.find(t => t.period === '0y') || {}, y1 = tr.find(t => t.period === '+1y') || {};
       const d = x => (x ? new Date(x).toISOString().slice(0, 10) : '');
       if (fd.currentPrice) r['Yahoo price'] = fd.currentPrice;
