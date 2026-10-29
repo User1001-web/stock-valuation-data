@@ -151,6 +151,7 @@ function onOpen() {
     .addItem('Load latest data from GitHub now', 'refreshFundamentals')
     .addItem('Recalculate valuations', 'recalcValuations')
     .addItem('Rebuild Market tab', 'rebuildMarket')
+    .addItem('Repair formulas (after sorting)', 'repairFormulas')
     .addToUi();
 }
 
@@ -158,10 +159,12 @@ function onOpen() {
 function onEdit(e) {
   try {
     var name = e.range.getSheet().getName();
-    if ((name === SHEET.TICKERS || name === SHEET.HOLDINGS) && e.range.getColumn() <= 2) syncMarket_();
+    if ((name === SHEET.TICKERS || name === SHEET.HOLDINGS) && e.range.getColumn() <= 2) { syncMarket_(); recalcValuations(); }
     if (name === SHEET.ASSUME || (name === SHEET.TICKERS && e.range.getColumn() >= 5 && e.range.getColumn() <= 7)) recalcValuations();
   } catch (err) { /* never block an edit */ }
 }
+
+function repairFormulas() { repairFormulas_(); recalcValuations(); SpreadsheetApp.getActive().toast('Formulas repaired.', 'Valuation', 5); }
 
 function setup() {
   var ss = SpreadsheetApp.getActive();
@@ -226,6 +229,17 @@ function ensureSheet_(name, headers) {
   sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
   sh.setFrozenRows(1);
   return sh;
+}
+
+/** Rewrites the formula-only columns on Tickers (D) and Holdings (F onwards). Safe after sorting. */
+function repairFormulas_() {
+  var ss = SpreadsheetApp.getActive();
+  var tk = ss.getSheetByName(SHEET.TICKERS), ho = ss.getSheetByName(SHEET.HOLDINGS);
+  tk.getRange(2, 4, Math.max(tk.getMaxRows() - 1, 1), 1).clearContent();
+  writeTickerFormulas_();
+  ho.getRange(2, 6, Math.max(ho.getMaxRows() - 1, 1), 21).clearContent();
+  writeHoldingsFormulas_();
+  if (ss.getSheetByName(SHEET2.CALC)) writeHoldingsValuation_(true);
 }
 
 /* Tickers: column D shows whether each ticker is held or watched. */
@@ -336,6 +350,7 @@ function refreshFundamentals() {
   try {
     var tickers = allTickers_();
     syncMarket_();
+    repairFormulas_();
     var url = String(getNamed_('GITHUB_URL') || '').trim();
     if (!/^https:\/\//.test(url)) { log_('', 'Waiting: paste the raw_data.csv link next to "GitHub data URL" on Assumptions.'); return; }
 
@@ -921,7 +936,8 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var status = String(raw.Status || '');
   out.dataDate = raw['Latest period end'] || '';
   if (!raw.CIK || /^(Skipped|No SEC|SEC has no|Error|Waiting)/.test(status)) {
-    out.type = /ETF/.test(status) ? 'ETF' : /UK/.test(status) ? 'No UK data' : 'No SEC data';
+    out.type = /^Waiting/.test(status) ? 'Waiting for data' : /ETF/.test(status) ? 'ETF' : /UK/.test(status) ? 'No UK data' : 'No SEC data';
+    if (/^Waiting/.test(status)) out.notes.push('Financials arrive with the next GitHub run (daily 05:17 UTC, or Run workflow on GitHub)');
     return out;
   }
   if (out.dataDate && today - dnum_(out.dataDate) > S.maxAgeMonths * 30.4) {
@@ -1272,6 +1288,8 @@ function recalcValuations() {
   var tk = ss.getSheetByName(SHEET.TICKERS);
   var tv = tk.getLastRow() > 1 ? tk.getRange(2, 1, tk.getLastRow() - 1, 7).getValues() : [];
   var hist = historyIndex_(today);
+  var hs = ss.getSheetByName(SHEET.HOLDINGS), held = {};
+  if (hs.getLastRow() > 1) hs.getRange(2, 1, hs.getLastRow() - 1, 1).getValues().forEach(function (r) { var t = String(r[0]).trim().toUpperCase(); if (t) held[t] = 1; });
 
   // Exchange rates: reported currency -> listing currency
   var need = {};
@@ -1297,7 +1315,7 @@ function recalcValuations() {
     try {
       v = valueCompany(rw, m, rate, { type: r[4], growth: r[5], margin: r[6] }, S, hist[t] || null, today);
     } catch (e) { v = { type: 'Error', notes: [e.message], models: {}, signals: {} }; }
-    v.ticker = t; v.name = m.name || rw['SEC name'] || ''; v.list = r[3] || ''; v.ccy = m.currency || '';
+    v.ticker = t; v.name = m.name || rw['SEC name'] || ''; v.list = held[t] ? 'Holding' : 'Watchlist'; v.ccy = m.currency || '';
     v.dirText = v.scoreOf ? v.score + '/' + v.scoreOf : '';
     v.usedCount = v.used ? v.used.length : '';
     v.usedNames = v.used ? v.used.join(', ') : '';
@@ -1433,7 +1451,7 @@ function ensureSettings_() {
 }
 
 /** Holdings: valuation columns to the right of the existing ones. */
-function writeHoldingsValuation_() {
+function writeHoldingsValuation_(formulasOnly) {
   var sh = SpreadsheetApp.getActive().getSheetByName(SHEET.HOLDINGS);
   var heads = ['Type', 'Fair value (local)', 'Low', 'High', 'Upside', 'Exp. return a year (5 yrs)', 'Direction', 'Status', 'Review', 'Analyst target'];
   sh.getRange(1, 14, 1, heads.length).setValues([heads]).setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#1F3A5F').setWrap(true);
@@ -1455,7 +1473,7 @@ function writeHoldingsValuation_() {
     look('Direction change (3 months)') + ')<=-2,"Direction score fell 2+ in 3 months.",""))))');
   var fmt = { O: '#,##0.00', P: '#,##0.00', Q: '#,##0.00', R: '0.0%;[Red]-0.0%', S: '0.0%;[Red]-0.0%' };
   Object.keys(fmt).forEach(function (c) { sh.getRange(c + '2:' + c + '500').setNumberFormat(fmt[c]); });
-  [14, 15, 16, 17, 18, 19, 20, 21, 22].forEach(function (c, i) { sh.setColumnWidth(c, [110, 90, 80, 80, 70, 80, 70, 120, 240][i]); });
+  if (!formulasOnly) [14, 15, 16, 17, 18, 19, 20, 21, 22].forEach(function (c, i) { sh.setColumnWidth(c, [110, 90, 80, 80, 70, 80, 70, 120, 240][i]); });
 }
 
 /** Watchlist: watched (not held) stocks, best upside first. */
