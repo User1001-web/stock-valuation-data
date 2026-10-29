@@ -24,6 +24,7 @@ jobs:
         env:
           SEC_EMAIL: ${{ secrets.SEC_EMAIL }}
           TICKERS_CSV_URL: ${{ secrets.TICKERS_CSV_URL }}
+          FMP_KEY: ${{ secrets.FMP_KEY }}
       - name: Save data to the repository
         run: |
           git config user.name "github-actions[bot]"
