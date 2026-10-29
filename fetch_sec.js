@@ -263,7 +263,23 @@ async function addYahoo(rows, tickers) {
     if (m === 'ETF') continue;
     const sym = m === 'UK' ? r.Ticker.replace(/\.$/, '') + '.L' : r.Ticker.replace(/\./g, '-');
     try {
-      const q = await yf.quoteSummary(sym, { modules: ['financialData', 'earningsTrend', 'assetProfile'] }, { validateResult: false });
+      const q = await yf.quoteSummary(sym, { modules: ['financialData', 'earningsTrend', 'assetProfile', 'calendarEvents', 'earningsHistory'] }, { validateResult: false });
+      // Earnings calendar, last surprise and estimate revisions (next fiscal year EPS)
+      const ce = (q.calendarEvents && q.calendarEvents.earnings) || {};
+      const nextDates = (ce.earningsDate || []).map(x => new Date(x)).filter(x => !isNaN(x)).sort((a, b) => a - b);
+      if (nextDates.length) r['Next earnings'] = nextDates[0].toISOString().slice(0, 10) + (ce.isEarningsDateEstimate ? ' (est.)' : '');
+      const hist = ((q.earningsHistory && q.earningsHistory.history) || []).filter(h => h.quarter && typeof h.surprisePercent === 'number')
+        .sort((a, b) => new Date(b.quarter) - new Date(a.quarter));
+      if (hist.length) { r['Last EPS surprise'] = hist[0].surprisePercent; r['Last earnings quarter'] = new Date(hist[0].quarter).toISOString().slice(0, 10); }
+      const trend = ((q.earningsTrend && q.earningsTrend.trend) || []).find(t => t.period === '+1y') || {};
+      const et = trend.epsTrend || {}, er = trend.epsRevisions || {};
+      if (typeof et.current === 'number') {
+        r['EPS est now'] = et.current;
+        if (typeof et['30daysAgo'] === 'number') r['EPS est 30d ago'] = et['30daysAgo'];
+        if (typeof et['90daysAgo'] === 'number') r['EPS est 90d ago'] = et['90daysAgo'];
+      }
+      if (typeof er.upLast30days === 'number') r['Revisions up 30d'] = er.upLast30days;
+      if (typeof er.downLast30days === 'number') r['Revisions down 30d'] = er.downLast30days;
       const fd = q.financialData || {}, tr = (q.earningsTrend && q.earningsTrend.trend) || [];
       const ap = q.assetProfile || {};
       if (ap.sector) r.Sector = ap.sector;

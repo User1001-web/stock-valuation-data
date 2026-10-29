@@ -136,7 +136,9 @@ var RAW_COLS = (function () {
   });
   c.push('Notes');
   c.push('Est FY1 end', 'Est revenue FY1', 'Est revenue FY2', 'Est EPS FY1', 'Est EPS FY2', 'Est analysts',
-    'Target consensus', 'Target high', 'Target low', 'Est FY2 end', 'Est source', 'Sector', 'Yahoo price', 'Yahoo industry');
+    'Target consensus', 'Target high', 'Target low', 'Est FY2 end', 'Est source', 'Sector', 'Yahoo price', 'Yahoo industry',
+    'Next earnings', 'Last EPS surprise', 'Last earnings quarter', 'EPS est now', 'EPS est 30d ago', 'EPS est 90d ago',
+    'Revisions up 30d', 'Revisions down 30d');
   return c;
 })();
 
@@ -933,6 +935,14 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var out = { models: {}, notes: [], signals: {} };
   out.analystTarget = n_(raw['Target consensus']);
   out.analysts = n_(raw['Est analysts']);
+  out.nextEarnings = raw['Next earnings'] || '';
+  out.surprise = n_(raw['Last EPS surprise']);
+  if (out.surprise !== null && Math.abs(out.surprise) > 5) out.surprise = out.surprise / 100;   // percent vs fraction
+  var eNow = n_(raw['EPS est now']), e30 = n_(raw['EPS est 30d ago']), e90 = n_(raw['EPS est 90d ago']);
+  var chg = function (a, b) { return a !== null && b !== null && b !== 0 ? (a - b) / Math.abs(b) : null; };
+  out.estChg30 = chg(eNow, e30); out.estChg90 = chg(eNow, e90);
+  var up30 = n_(raw['Revisions up 30d']), dn30 = n_(raw['Revisions down 30d']);
+  out.revisionsText = up30 !== null || dn30 !== null ? (up30 || 0) + ' up / ' + (dn30 || 0) + ' down' : '';
   var status = String(raw.Status || '');
   out.dataDate = raw['Latest period end'] || '';
   if (!raw.CIK || /^(Skipped|No SEC|SEC has no|Error|Waiting)/.test(status)) {
@@ -1193,7 +1203,9 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   sig.Shares = dil === null ? null : dil <= 0.01;
   var opInc1 = F('OperatingIncome TTM 1y ago');
   sig.ROIC = out.roic !== null && out.roic >= 0.15 ? true : opInc !== null && opInc1 !== null ? opInc > opInc1 : null;
-  sig['Fair value'] = past && past.fv && out.fv ? out.fv >= past.fv : null;
+  // Analysts raising next-year EPS estimates (90-day change, else 30-day up vs down revisions)
+  sig.Estimates = out.estChg90 !== null && Math.abs(out.estChg90) > 0.005 ? out.estChg90 > 0 :
+    (up30 !== null && dn30 !== null && up30 + dn30 > 0 ? up30 > dn30 : null);
   var keys = Object.keys(sig), avail = keys.filter(function (k) { return sig[k] !== null; });
   out.score = avail.filter(function (k) { return sig[k]; }).length;
   out.scoreOf = avail.length;
@@ -1239,7 +1251,10 @@ var CALC_COLS = [
   ['Analysts', '0', 'analysts'],
   ['EPS for PEG', '#,##0.00', 'pegEps'], ['Expected EPS growth', '0.0%;[Red]-0.0%', 'epsGrowth'], ['PEG basis', '@', 'epsGrowthBasis'],
   ['PEG', '0.00', 'F:peg'], ['Expectations gap (implied - expected growth)', '+0.0%;[Red]-0.0%', 'expGap'],
-  ['Model vs analysts', '+0%;[Red]-0%', 'modelVsAnalysts'], ['Sort key', '0.000', 'F:sort']
+  ['Model vs analysts', '+0%;[Red]-0%', 'modelVsAnalysts'],
+  ['Next earnings', '@', 'nextEarnings'], ['Last EPS surprise', '+0.0%;[Red]-0.0%', 'surprise'],
+  ['EPS estimate change 30d', '+0.0%;[Red]-0.0%', 'estChg30'], ['EPS estimate change 90d', '+0.0%;[Red]-0.0%', 'estChg90'],
+  ['Analyst revisions 30d', '@', 'revisionsText'], ['Sort key', '0.000', 'F:sort']
 ];
 function calcIdx_(header) { for (var i = 0; i < CALC_COLS.length; i++) if (CALC_COLS[i][0] === header) return i + 1; throw new Error(header); }
 function calcL_(header) { return colL_(calcIdx_(header)); }
@@ -1461,7 +1476,9 @@ var HOLDINGS_COLS = [
   ['Direction', 'Direction', '@', 70], ['Status', 'Status', '@', 120], ['Review', null, '@', 240],
   ['Analyst target', 'Analyst target', '#,##0.00', 85], ['PEG', 'PEG', '0.00', 60],
   ['Expectations gap', 'Expectations gap (implied - expected growth)', '+0.0%;[Red]-0.0%', 90],
-  ['Model vs analysts', 'Model vs analysts', '+0%;[Red]-0%', 85]
+  ['Model vs analysts', 'Model vs analysts', '+0%;[Red]-0%', 85],
+  ['Next earnings', 'Next earnings', '@', 110], ['Last EPS surprise', 'Last EPS surprise', '+0.0%;[Red]-0.0%', 80],
+  ['EPS est. change 90d', 'EPS estimate change 90d', '+0.0%;[Red]-0.0%', 80], ['Revisions 30d', 'Analyst revisions 30d', '@', 100]
 ];
 var HOLDINGS_FIRST = 14;
 
@@ -1493,7 +1510,10 @@ var WATCH_COLS = [
   ['Cash runway (months)', 'Cash runway (months)', '0'], ['Dilution 1-yr', 'Dilution 1-yr', '0.0%;[Red]-0.0%'],
   ['Analyst target', 'Analyst target', '#,##0.00'], ['PEG', 'PEG', '0.00'],
   ['Expectations gap', 'Expectations gap (implied - expected growth)', '+0.0%;[Red]-0.0%'],
-  ['Model vs analysts', 'Model vs analysts', '+0%;[Red]-0%'], ['Notes', 'Notes', '@']
+  ['Model vs analysts', 'Model vs analysts', '+0%;[Red]-0%'],
+  ['Next earnings', 'Next earnings', '@'], ['Last EPS surprise', 'Last EPS surprise', '+0.0%;[Red]-0.0%'],
+  ['EPS est. change 90d', 'EPS estimate change 90d', '+0.0%;[Red]-0.0%'], ['Revisions 30d', 'Analyst revisions 30d', '@'],
+  ['Notes', 'Notes', '@']
 ];
 function watchCol_(header) {
   for (var i = 0; i < WATCH_COLS.length; i++) if (WATCH_COLS[i][0] === header) return colL_(i + 1);
