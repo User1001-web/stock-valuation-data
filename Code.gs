@@ -61,7 +61,8 @@ var TAGS = {
     Cash: ['CashAndCashEquivalentsAtCarryingValue',
       'CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents', 'Cash'],
     ShortTermInvestments: ['ShortTermInvestments', 'MarketableSecuritiesCurrent',
-      'AvailableForSaleSecuritiesDebtSecuritiesCurrent'],
+      'AvailableForSaleSecuritiesDebtSecuritiesCurrent', 'MarketableSecurities',
+      'AvailableForSaleSecuritiesDebtSecurities'],
     Equity: ['StockholdersEquity', 'StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest'],
     SharesOutstanding: ['CommonStockSharesOutstanding'],
     // Debt: the first group with a value at the latest balance-sheet date is used.
@@ -78,11 +79,14 @@ var TAGS = {
       ['ConvertibleNotesPayable', 'ConvertibleNotesPayableCurrent'],
       ['ConvertibleDebtNoncurrent', 'ConvertibleDebtCurrent'],
       ['ConvertibleSeniorNotesNoncurrent'],
+      ['ConvertibleLongTermNotesPayable', 'ConvertibleNotesPayableCurrent'],
+      ['SeniorNotes'],
       ['UnsecuredDebt'],
       ['SecuredDebt'],
       ['DebtInstrumentCarryingAmount'],
       ['OtherLongTermDebtNoncurrent', 'OtherLongTermDebtCurrent'],
       ['LongTermLineOfCredit'],
+      ['LineOfCredit'],
       ['DebtCurrent']
     ],
     DebtExtras: ['ShortTermBorrowings', 'CommercialPaper']
@@ -583,8 +587,8 @@ function instantNear_(s, endDay, tol) {
 
 /**
  * Total debt at the balance-sheet date: the first tag group with a value there.
- * If none is tagged on that date, the most recent value within 200 days is used
- * (companies sometimes switch tags between reports).
+ * If none is tagged on that date, the most recent value within 400 days is used
+ * (some companies only tag debt in annual reports, or switch tags).
  */
 function debtAt_(ns, map, ccy, endDay) {
   var groups = map.DebtGroups || [];
@@ -601,11 +605,11 @@ function debtAt_(ns, map, ccy, endDay) {
     }, 0);
     return { val: total + extrasAt(endDay, 5), found: true, day: endDay };
   }
-  // Nothing tagged on the balance-sheet date: take the latest group value in the prior 200 days.
+  // Nothing tagged on the balance-sheet date: take the latest group value in the prior 400 days.
   var best = null;
   groups.forEach(function (grp) {
     var s = instantSeries_(ns, [grp[0]], 'money', ccy).filter(function (f) {
-      var d = dnum_(f.end); return d <= endDay && d >= endDay - 200;
+      var d = dnum_(f.end); return d <= endDay && d >= endDay - 400;
     });
     if (!s.length) return;
     var day = dnum_(s[0].end);
