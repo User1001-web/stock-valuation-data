@@ -107,7 +107,7 @@ async function main() {
   for (const t of tickers) {
     let row;
     try {
-      if (t.market === 'UK') row = { Ticker: t.ticker, Status: 'Skipped: UK listing (fundamentals come in a later stage)' };
+      if (t.market === 'UK') row = await ukRow(t.ticker);
       else if (t.market === 'ETF') row = { Ticker: t.ticker, Status: 'Skipped: ETF (not valued)' };
       else {
         const cik = ciks[t.ticker] || ciks[t.ticker.replace(/\./g, '-')];
@@ -158,15 +158,94 @@ async function main() {
   console.log(`\nWrote ${rows.length} rows (${ok} OK) to raw_data.csv`);
 }
 
+// UK listings: annual statements and trailing-12-month figures from Yahoo Finance, mapped to
+// the same Raw Data columns as SEC companies. Balance sheet from the latest annual report.
+let yfInstance = null;
+async function yahoo() {
+  if (yfInstance) return yfInstance;
+  const YF = (await import('yahoo-finance2')).default;
+  yfInstance = typeof YF === 'function' ? new YF({ suppressNotices: ['yahooSurvey', 'ripHistorical'] }) : YF;
+  return yfInstance;
+}
+const UK_MAP = {
+  Revenue: ['totalRevenue', 'operatingRevenue'], GrossProfit: ['grossProfit'], OperatingIncome: ['operatingIncome', 'EBIT'],
+  NetIncome: ['netIncomeCommonStockholders', 'netIncome'], PretaxIncome: ['pretaxIncome'], IncomeTax: ['taxProvision'],
+  InterestExpense: ['interestExpense'], OCF: ['operatingCashFlow'], Capex: ['capitalExpenditure'], SBC: ['stockBasedCompensation'],
+  DA: ['reconciledDepreciation', 'depreciationAndAmortization'], DividendsPaid: ['cashDividendsPaid', 'commonStockDividendPaid'],
+  Buybacks: ['repurchaseOfCapitalStock'], EPS: ['dilutedEPS', 'basicEPS'], DilutedShares: ['dilutedAverageShares', 'basicAverageShares']
+};
+const POSITIVE = new Set(['Capex', 'DividendsPaid', 'Buybacks']);   // Yahoo reports these as negative cash flows
+function ukVal(rec, field) {
+  if (!rec) return '';
+  for (const k of UK_MAP[field]) {
+    const v = rec[k];
+    if (typeof v === 'number' && isFinite(v)) return POSITIVE.has(field) ? Math.abs(v) : v;
+  }
+  return '';
+}
+const isoOf = d => (typeof d === 'number' ? new Date(d * (d < 1e11 ? 1000 : 1)) : new Date(d)).toISOString().slice(0, 10);
+async function ukRow(ticker) {
+  const sym = ticker + '.L';
+  const yf = await yahoo();
+  const row = { Ticker: ticker, CIK: 'LSE', 'Filer form': 'Yahoo Finance (LSE)', Accounting: 'IFRS' };
+  try {
+    const annual = (await yf.fundamentalsTimeSeries(sym, { period1: '2019-01-01', type: 'annual', module: 'all' }, { validateResult: false }))
+      .map(r => Object.assign({}, r, { iso: isoOf(r.date) })).sort((a, b) => (a.iso < b.iso ? 1 : -1));
+    await sleep(300);
+    const trailing = (await yf.fundamentalsTimeSeries(sym, { period1: '2023-01-01', type: 'trailing', module: 'all' }, { validateResult: false }))
+      .map(r => Object.assign({}, r, { iso: isoOf(r.date) })).sort((a, b) => (a.iso < b.iso ? 1 : -1));
+    await sleep(300);
+    const qs = await yf.quoteSummary(sym, { modules: ['assetProfile', 'price', 'financialData'] }, { validateResult: false });
+    await sleep(300);
+    if (!annual.length) return { Ticker: ticker, Status: 'No UK financial data on Yahoo Finance' };
+    row['SEC name'] = (qs.price && qs.price.longName) || '';
+    row.Industry = (qs.assetProfile && qs.assetProfile.industry) || '';
+    row.Sector = (qs.assetProfile && qs.assetProfile.sector) || '';
+    row.Currency = (qs.financialData && qs.financialData.financialCurrency) || 'GBP';
+
+    const fy0 = annual[0], fy1 = annual[1];
+    const day = s => Date.parse(s) / 864e5;
+    // Use the latest trailing record if it is newer than the last annual report (adds half-year results).
+    const t0 = trailing.find(r => typeof r.netIncomeCommonStockholders === 'number' || typeof r.totalRevenue === 'number');
+    const useT = t0 && day(t0.iso) > day(fy0.iso) + 30;
+    const latest = useT ? t0 : fy0;
+    const prev = useT ? trailing.find(r => Math.abs(day(r.iso) - (day(t0.iso) - 365)) <= 45) || null : fy1;
+    row['Latest period end'] = latest.iso;
+    row['Latest FY end'] = fy0.iso;
+    row['Last filed'] = '';
+    ['Revenue', 'GrossProfit', 'OperatingIncome', 'NetIncome', 'PretaxIncome', 'IncomeTax', 'InterestExpense', 'OCF', 'Capex', 'SBC', 'DA', 'DividendsPaid', 'Buybacks']
+      .forEach(f => {
+        let v = ukVal(latest, f); if (v === '' && useT) v = ukVal(fy0, f);
+        row[f + ' TTM'] = v;
+        row[f + ' TTM 1y ago'] = ukVal(prev, f);
+      });
+    row['EPS TTM'] = ukVal(latest, 'EPS'); row['EPS TTM 1y ago'] = ukVal(prev, 'EPS');
+    row['Diluted shares latest'] = ukVal(latest, 'DilutedShares') || ukVal(fy0, 'DilutedShares');
+    row['Diluted shares 1y ago'] = ukVal(prev, 'DilutedShares') || ukVal(fy1, 'DilutedShares');
+    row['Shares outstanding'] = typeof fy0.ordinarySharesNumber === 'number' ? fy0.ordinarySharesNumber : '';
+    row.Cash = typeof fy0.cashAndCashEquivalents === 'number' ? fy0.cashAndCashEquivalents : '';
+    row['Short-term investments'] = typeof fy0.otherShortTermInvestments === 'number' ? fy0.otherShortTermInvestments : 0;
+    row['Total debt'] = typeof fy0.totalDebt === 'number' ? fy0.totalDebt : 0;
+    const eq = r => (r ? (typeof r.commonStockEquity === 'number' ? r.commonStockEquity : typeof r.stockholdersEquity === 'number' ? r.stockholdersEquity : '') : '');
+    row.Equity = eq(fy0); row['Equity 1y ago'] = eq(fy1);
+    row['Balance sheet date'] = fy0.iso;
+    const H = { Revenue: 1, GrossProfit: 1, OperatingIncome: 1, NetIncome: 1, OCF: 1, Capex: 1, SBC: 1, EPS: 1, DilutedShares: 1, DividendsPaid: 1 };
+    Object.keys(H).forEach(f => { for (let i = 0; i <= 5; i++) row[f + ' FY' + (i === 0 ? '0' : '-' + i)] = ukVal(annual[i], f); });
+    const need = ['NetIncome TTM', 'Diluted shares latest', 'Equity'];
+    const missing = need.filter(k => row[k] === '' || row[k] === undefined);
+    row.Status = missing.length ? 'Partial: missing ' + missing.join(', ') : 'OK';
+    row.Notes = 'UK figures from Yahoo Finance' + (useT ? ' (trailing 12 months incl. half-year results)' : ' (annual)');
+  } catch (e) {
+    return { Ticker: ticker, Status: 'Error: UK data ' + String(e.message).slice(0, 120) };
+  }
+  return row;
+}
+
 // Analyst targets and current/next fiscal-year estimates from Yahoo Finance (unofficial, via the
 // yahoo-finance2 package). Covers nearly all US and UK listings; FMP fills any gaps.
 async function addYahoo(rows, tickers) {
   let yf;
-  try {
-    const mod = await import('yahoo-finance2');
-    const YF = mod.default;
-    yf = typeof YF === 'function' ? new YF({ suppressNotices: ['yahooSurvey'] }) : YF;
-  } catch (e) { console.log('Yahoo library not available: ' + e.message); return; }
+  try { yf = await yahoo(); } catch (e) { console.log('Yahoo library not available: ' + e.message); return; }
   const market = {};
   tickers.forEach(t => { market[t.ticker] = t.market; });
   let ok = 0, fail = 0;

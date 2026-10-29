@@ -136,7 +136,7 @@ var RAW_COLS = (function () {
   });
   c.push('Notes');
   c.push('Est FY1 end', 'Est revenue FY1', 'Est revenue FY2', 'Est EPS FY1', 'Est EPS FY2', 'Est analysts',
-    'Target consensus', 'Target high', 'Target low', 'Est FY2 end', 'Est source');
+    'Target consensus', 'Target high', 'Target low', 'Est FY2 end', 'Est source', 'Sector');
   return c;
 })();
 
@@ -921,7 +921,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var status = String(raw.Status || '');
   out.dataDate = raw['Latest period end'] || '';
   if (!raw.CIK || /^(Skipped|No SEC|SEC has no|Error|Waiting)/.test(status)) {
-    out.type = /UK/.test(status) ? 'UK (later stage)' : /ETF/.test(status) ? 'ETF' : 'No SEC data';
+    out.type = /ETF/.test(status) ? 'ETF' : /UK/.test(status) ? 'No UK data' : 'No SEC data';
     return out;
   }
   if (out.dataDate && today - dnum_(out.dataDate) > S.maxAgeMonths * 30.4) {
@@ -967,6 +967,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var ovType = String(ovr.type || '').trim();
   if (ovType && MODELS_BY_TYPE[ovType]) { type = ovType; out.notes.push('Type set by override'); }
   else if (((sic >= 6000 && sic <= 6299) || sic === 6726) && !(rev && capex / rev > 0.1)) type = 'Financial';
+  else if (raw.CIK === 'LSE' && (!raw.Sector || raw.Sector === 'Financial Services' || raw.Sector === 'Real Estate')) type = 'Financial';
   else if (ni === null || ni <= 0) type = 'Pre-profit';
   else if ((mean_([yoy, cagr3]) || 0) >= S.growthThreshold) type = 'Growth';
   else type = 'Mature';
@@ -1235,7 +1236,10 @@ function recalcValuations() {
   var need = {};
   tv.forEach(function (r) {
     var t = String(r[0]).trim().toUpperCase(), rw = raw[t], m = market[t];
-    if (rw && rw.Currency && m && m.currency && rw.Currency !== m.currency) need[rw.Currency + m.currency] = 1;
+    if (rw && rw.Currency && m && m.currency && rw.Currency !== m.currency) {
+      if (m.currency === 'GBX') { if (rw.Currency !== 'GBP') need[rw.Currency + 'GBP'] = 1; }
+      else need[rw.Currency + m.currency] = 1;
+    }
   });
   var fx = fxRates_(Object.keys(need));
 
@@ -1244,7 +1248,10 @@ function recalcValuations() {
     var t = String(r[0]).trim().toUpperCase();
     if (!t) return;
     var rw = raw[t] || { Ticker: t, Status: 'Waiting for data' }, m = market[t] || {};
-    var rate = !rw.Currency || !m.currency || rw.Currency === m.currency ? 1 : (fx[rw.Currency + m.currency] || null);
+    var rate;
+    if (!rw.Currency || !m.currency || rw.Currency === m.currency) rate = 1;
+    else if (m.currency === 'GBX') rate = rw.Currency === 'GBP' ? 100 : (fx[rw.Currency + 'GBP'] ? fx[rw.Currency + 'GBP'] * 100 : null);   // pence
+    else rate = fx[rw.Currency + m.currency] || null;
     var v;
     try {
       v = valueCompany(rw, m, rate, { type: r[4], growth: r[5], margin: r[6] }, S, hist[t] || null, today);
