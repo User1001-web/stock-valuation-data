@@ -936,6 +936,8 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   out.analystTarget = n_(raw['Target consensus']);
   out.analysts = n_(raw['Est analysts']);
   out.nextEarnings = raw['Next earnings'] || '';
+  var ne = String(out.nextEarnings).slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(ne) && dnum_(ne) < today) out.nextEarnings = 'Reported ' + ne + ' (next date not set)';
   out.surprise = n_(raw['Last EPS surprise']);
   if (out.surprise !== null && Math.abs(out.surprise) > 5) out.surprise = out.surprise / 100;   // percent vs fraction
   var eNow = n_(raw['EPS est now']), e30 = n_(raw['EPS est 30d ago']), e90 = n_(raw['EPS est 90d ago']);
