@@ -32,6 +32,22 @@ function compactFacts(facts, sub) {
       out.facts[ns][tag] = { units };
     });
   });
+  // Discovery: every tag name the company uses, plus debt-like balance-sheet facts.
+  out.tagNames = {};
+  const DEBTLIKE = /Debt|Borrowing|NotesPayable|SeniorNotes|LineOfCredit|Loans?Payable|Convertible/;
+  Object.keys(facts.facts || {}).forEach(ns => {
+    out.tagNames[ns] = Object.keys(facts.facts[ns]);
+    if (ns === 'dei') return;
+    Object.keys(facts.facts[ns]).forEach(tag => {
+      if (!DEBTLIKE.test(tag) || (out.facts[ns] && out.facts[ns][tag])) return;
+      const units = {};
+      Object.entries(facts.facts[ns][tag].units || {}).forEach(([u, arr]) => {
+        const inst = arr.filter(f => !f.start && f.end >= '2023-01-01').map(f => ({ end: f.end, val: f.val, form: f.form, filed: f.filed }));
+        if (inst.length) units[u] = inst;
+      });
+      if (Object.keys(units).length) { out.facts[ns] = out.facts[ns] || {}; out.facts[ns][tag] = { units }; }
+    });
+  });
   const r = (sub && sub.filings && sub.filings.recent) || {};
   out.submissions = sub ? { name: sub.name, sic: sub.sic, sicDescription: sub.sicDescription,
     filings: { recent: { form: (r.form || []).slice(0, 40), filingDate: (r.filingDate || []).slice(0, 40) } } } : null;

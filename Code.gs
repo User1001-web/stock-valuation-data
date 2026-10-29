@@ -68,9 +68,21 @@ var TAGS = {
     DebtGroups: [
       ['LongTermDebt'],
       ['LongTermDebtNoncurrent', 'LongTermDebtCurrent'],
+      ['DebtLongtermAndShorttermCombinedAmount'],
+      ['LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities'],
       ['LongTermDebtAndCapitalLeaseObligations', 'LongTermDebtAndCapitalLeaseObligationsCurrent'],
+      ['DebtAndCapitalLeaseObligations'],
+      ['LongTermNotesPayable', 'NotesPayableCurrent'],
+      ['NotesPayable'],
+      ['SeniorLongTermNotes'],
       ['ConvertibleNotesPayable', 'ConvertibleNotesPayableCurrent'],
       ['ConvertibleDebtNoncurrent', 'ConvertibleDebtCurrent'],
+      ['ConvertibleSeniorNotesNoncurrent'],
+      ['UnsecuredDebt'],
+      ['SecuredDebt'],
+      ['DebtInstrumentCarryingAmount'],
+      ['OtherLongTermDebtNoncurrent', 'OtherLongTermDebtCurrent'],
+      ['LongTermLineOfCredit'],
       ['DebtCurrent']
     ],
     DebtExtras: ['ShortTermBorrowings', 'CommercialPaper']
@@ -407,6 +419,8 @@ function pickUnit_(units, kind, ccy) {
 }
 
 var ANNUAL_FORM = /^(10-K|10-KT|20-F|40-F)/;
+// Only financial reports count (proxy statements and 8-Ks also carry tagged figures).
+var REPORT_FORM = /^(10-K|10-Q|10-KT|10-QT|20-F|40-F|6-K)/;
 
 /**
  * Duration facts for ONE tag, one value per period. When several filings report
@@ -418,7 +432,7 @@ function tagSeries_(ns, tag, kind, ccy, rank) {
   var u = pickUnit_(t.units, kind, ccy); if (!u) return [];
   var groups = {};
   t.units[u].forEach(function (f) {
-    if (!f.start || f.val === null || f.val === undefined) return;
+    if (!f.start || f.val === null || f.val === undefined || !REPORT_FORM.test(f.form || '')) return;
     (groups[f.start + '|' + f.end] = groups[f.start + '|' + f.end] || []).push(f);
   });
   return Object.keys(groups).map(function (key) {
@@ -517,7 +531,7 @@ function instantSeries_(ns, tags, kind, ccy) {
     var t = ns[tag]; if (!t) return;
     var u = pickUnit_(t.units, kind, ccy); if (!u) return;
     t.units[u].forEach(function (f) {
-      if (f.start || f.val === null || f.val === undefined) return;
+      if (f.start || f.val === null || f.val === undefined || !REPORT_FORM.test(f.form || '')) return;
       var cur = out[f.end];
       if (!cur || rank < cur.rank || (rank === cur.rank && f.filed > cur.filed)) {
         out[f.end] = { end: f.end, val: f.val, filed: f.filed, rank: rank };
@@ -567,21 +581,43 @@ function instantNear_(s, endDay, tol) {
   return c.length ? c[0].val : null;
 }
 
+/**
+ * Total debt at the balance-sheet date: the first tag group with a value there.
+ * If none is tagged on that date, the most recent value within 200 days is used
+ * (companies sometimes switch tags between reports).
+ */
 function debtAt_(ns, map, ccy, endDay) {
   var groups = map.DebtGroups || [];
+  var extrasAt = function (day, tol) {
+    return (map.DebtExtras || []).reduce(function (s, tag) {
+      return s + (instantNear_(instantSeries_(ns, [tag], 'money', ccy), day, tol) || 0);
+    }, 0);
+  };
   for (var g = 0; g < groups.length; g++) {
-    var vals = groups[g].map(function (tag) { return instantNear_(instantSeries_(ns, [tag], 'money', ccy), endDay, 5); });
-    if (vals[0] === null) continue;
-    var total = vals.reduce(function (s, v) { return s + (v || 0); }, 0);
-    (map.DebtExtras || []).forEach(function (tag) {
-      var v = instantNear_(instantSeries_(ns, [tag], 'money', ccy), endDay, 5);
-      if (v) total += v;
-    });
-    return { val: total, found: true };
+    var first = instantSeries_(ns, [groups[g][0]], 'money', ccy);
+    if (instantNear_(first, endDay, 5) === null) continue;
+    var total = groups[g].reduce(function (s, tag) {
+      return s + (instantNear_(instantSeries_(ns, [tag], 'money', ccy), endDay, 5) || 0);
+    }, 0);
+    return { val: total + extrasAt(endDay, 5), found: true, day: endDay };
   }
-  var extras = (map.DebtExtras || []).map(function (tag) { return instantNear_(instantSeries_(ns, [tag], 'money', ccy), endDay, 5) || 0; });
-  var sum = extras.reduce(function (s, v) { return s + v; }, 0);
-  return { val: sum, found: sum > 0 };
+  // Nothing tagged on the balance-sheet date: take the latest group value in the prior 200 days.
+  var best = null;
+  groups.forEach(function (grp) {
+    var s = instantSeries_(ns, [grp[0]], 'money', ccy).filter(function (f) {
+      var d = dnum_(f.end); return d <= endDay && d >= endDay - 200;
+    });
+    if (!s.length) return;
+    var day = dnum_(s[0].end);
+    if (best && day <= best.day) return;
+    var total = grp.reduce(function (sum, tag) {
+      return sum + (instantNear_(instantSeries_(ns, [tag], 'money', ccy), day, 5) || 0);
+    }, 0);
+    best = { val: total + extrasAt(day, 5), found: true, day: day, earlier: true };
+  });
+  if (best) return best;
+  var ex = extrasAt(endDay, 5);
+  return { val: ex, found: ex > 0, day: endDay };
 }
 
 function latestEndDay_(series) {
@@ -665,7 +701,8 @@ function parseCompany(ticker, cik, facts, sub) {
     row[f + ' TTM'] = v === null ? '' : v;
     row[f + ' TTM 1y ago'] = v1 === null ? '' : v1;
   });
-  if (stale.length) notes.push('Older period used for: ' + stale.join(', '));
+  var keyStale = stale.filter(function (f) { return ['Revenue', 'GrossProfit', 'OperatingIncome', 'NetIncome', 'OCF', 'Capex'].indexOf(f) >= 0; });
+  if (keyStale.length) notes.push('Older period used for: ' + keyStale.join(', '));
 
   var et = ttmField_(F.EPS, end, endPrev, ''), eps = et.v, eps1 = et.v1;
   row['EPS TTM'] = eps === null ? '' : eps;
@@ -689,7 +726,8 @@ function parseCompany(ticker, cik, facts, sub) {
     row['Equity 1y ago'] = eq1 === null ? '' : eq1;
     var debt = debtAt_(ns, map, ccy, bsEnd);
     row['Total debt'] = debt.val;
-    if (!debt.found) notes.push('No debt reported at latest balance sheet (taken as 0)');
+    if (!debt.found) notes.push('No debt tagged in filings (taken as 0)');
+    else if (debt.earlier) notes.push('Debt taken from ' + isoDay_(debt.day) + ' (not tagged on the latest balance sheet)');
   }
   var dei = facts.facts.dei && facts.facts.dei.EntityCommonStockSharesOutstanding;
   var so = dei ? instantSeries_(facts.facts.dei, ['EntityCommonStockSharesOutstanding'], 'shares', ccy) : [];
