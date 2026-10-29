@@ -147,6 +147,7 @@ function onOpen() {
     .addItem('First-time setup', 'setup')
     .addSeparator()
     .addItem('Load latest data from GitHub now', 'refreshFundamentals')
+    .addItem('Recalculate valuations', 'recalcValuations')
     .addItem('Rebuild Market tab', 'rebuildMarket')
     .addToUi();
 }
@@ -156,6 +157,7 @@ function onEdit(e) {
   try {
     var name = e.range.getSheet().getName();
     if ((name === SHEET.TICKERS || name === SHEET.HOLDINGS) && e.range.getColumn() <= 2) syncMarket_();
+    if (name === SHEET.ASSUME || (name === SHEET.TICKERS && e.range.getColumn() >= 5 && e.range.getColumn() <= 7)) recalcValuations();
   } catch (err) { /* never block an edit */ }
 }
 
@@ -177,6 +179,12 @@ function setup() {
   writeTickerFormulas_();
   writeHoldingsFormulas_();
   rebuildMarket();
+  SpreadsheetApp.flush();            // let GOOGLEFINANCE start loading prices
+  ensureSettings_();
+  recalcValuations();
+  writeHoldingsValuation_();
+  writeWatchlist_();
+  writeColourRules_();
 
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (t.getHandlerFunction() === 'refreshFundamentals') ScriptApp.deleteTrigger(t);
@@ -340,6 +348,8 @@ function refreshFundamentals() {
     var sh = SpreadsheetApp.getActive().getSheetByName(SHEET.RAW);
     if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).clearContent();
     if (result.rows.length) sh.getRange(2, 1, result.rows.length, RAW_COLS.length).setValues(result.rows);
+    loadRates_(url);
+    recalcValuations();
 
     var prev = PropertiesService.getDocumentProperties().getProperty('LAST_STAMP');
     if (result.stamp !== prev) {
@@ -783,7 +793,636 @@ function log_(ticker, msg) {
   if (sh.getLastRow() > 501) sh.deleteRows(502, sh.getLastRow() - 501);
 }
 
+/* ======================================================================== */
+/*  STAGE 2 — VALUATION ENGINE (pure functions, no Sheets calls)            */
+/* ======================================================================== */
+
+/** Assumptions-tab rows: [label, default, number format, note]. Read by label. */
+var SETTINGS = [
+  ['Risk-free rate (10-yr Treasury)', 0.05, '0.00%', 'Updated automatically from FRED each day. To fix it yourself, use the override row below.'],
+  ['Risk-free rate override', '', '0.00%', 'Optional. Leave blank to use the automatic rate.'],
+  ['AAA corporate bond yield', 0.06, '0.00%', 'Updated automatically from FRED. Used by the Graham formula.'],
+  ['AAA yield override', '', '0.00%', 'Optional.'],
+  ['Equity risk premium', 0.045, '0.0%', 'Extra return investors demand from shares over Treasuries. Discount rate = risk-free + beta x this.'],
+  ['Beta floor', 0.8, '0.00', 'Betas below this are raised to it.'],
+  ['Beta cap', 2.0, '0.00', 'Betas above this are lowered to it.'],
+  ['Beta if missing', 1.2, '0.00', ''],
+  ['Discount rate floor', 0.07, '0.0%', ''],
+  ['Discount rate cap', 0.14, '0.0%', ''],
+  ['Required return (5-year models)', 0.10, '0.0%', 'Annual return used to discount the 5-year projection models back to today.'],
+  ['Starting growth cap', 0.35, '0.0%', 'Year-1 growth is capped here, then fades to terminal growth by year 10.'],
+  ['Growth floor', -0.10, '0.0%', ''],
+  ['Terminal growth', 0.03, '0.0%', 'Long-run growth after year 10 (roughly nominal GDP).'],
+  ['Exit P/E cap', 25, '0.0', 'Exit multiples = 8.5 + 2 x later growth (%), capped here.'],
+  ['Exit P/FCF cap', 30, '0.0', ''],
+  ['Margin of safety', 0.25, '0%', 'Buy-below price = fair value x (1 - this).'],
+  ['Subtract stock-based comp from FCF', 'No', '@', 'Yes or No.'],
+  ['Growth stock threshold (3-yr revenue CAGR)', 0.15, '0%', 'Profitable companies whose average of 1-yr and 3-yr revenue growth exceeds this are classed as Growth.'],
+  ['Default long-run FCF margin (pre-profit)', 0.15, '0%', 'Used when a company has no positive margin history. Per-stock override on Tickers.'],
+  ['Default long-run net margin (pre-profit)', 0.12, '0%', ''],
+  ['Stretched if 5-yr expected return below', 0.06, '0%', ''],
+  ['Max data age (months)', 15, '0', 'Older SEC data is not valued.']
+];
+
+function settingsFromMap_(m) {
+  var g = function (label) {
+    var row = SETTINGS.filter(function (r) { return r[0] === label; })[0];
+    var v = m[label];
+    if (v === '' || v === undefined || v === null) return row ? row[1] : null;
+    return v;
+  };
+  var num = function (label) { var v = g(label); return v === '' ? null : Number(v); };
+  var rfo = m['Risk-free rate override'], aao = m['AAA yield override'];
+  return {
+    rf: rfo !== '' && rfo !== undefined && rfo !== null ? Number(rfo) : num('Risk-free rate (10-yr Treasury)'),
+    aaa: aao !== '' && aao !== undefined && aao !== null ? Number(aao) : num('AAA corporate bond yield'),
+    erp: num('Equity risk premium'), betaMin: num('Beta floor'), betaMax: num('Beta cap'),
+    betaDefault: num('Beta if missing'), rMin: num('Discount rate floor'), rMax: num('Discount rate cap'),
+    req: num('Required return (5-year models)'), gCap: num('Starting growth cap'), gFloor: num('Growth floor'),
+    gTerm: num('Terminal growth'), peCap: num('Exit P/E cap'), pfcfCap: num('Exit P/FCF cap'),
+    mos: num('Margin of safety'), sbc: /^y/i.test(String(g('Subtract stock-based comp from FCF'))),
+    growthThreshold: num('Growth stock threshold (3-yr revenue CAGR)'),
+    defFcfMargin: num('Default long-run FCF margin (pre-profit)'),
+    defNetMargin: num('Default long-run net margin (pre-profit)'),
+    stretchReturn: num('Stretched if 5-yr expected return below'),
+    maxAgeMonths: num('Max data age (months)')
+  };
+}
+
+function n_(v) {
+  if (v === '' || v === null || v === undefined) return null;
+  var x = Number(v);
+  return isFinite(x) ? x : null;
+}
+function clamp_(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+function mean_(a) { a = a.filter(function (x) { return x !== null && isFinite(x); }); return a.length ? a.reduce(function (s, x) { return s + x; }, 0) / a.length : null; }
+function median_(a) { a = a.slice().sort(function (x, y) { return x - y; }); var k = a.length; return k ? (k % 2 ? a[(k - 1) / 2] : (a[k / 2 - 1] + a[k / 2]) / 2) : null; }
+
+/** Growth path: year-1 rate g0 fading in a straight line to terminal growth in year 10. */
+function growthPath_(g0, gT) {
+  var p = [];
+  for (var t = 1; t <= 10; t++) p.push(g0 + (gT - g0) * (t - 1) / 9);
+  return p;
+}
+function grow_(base, path, years) { var v = base; for (var t = 0; t < years; t++) v *= 1 + path[t]; return v; }
+function exitMultiple_(laterGrowth, cap) { return clamp_(8.5 + 2 * laterGrowth * 100, 8, cap); }
+
+/** Two-stage DCF per share: 10 years on the growth path, then a terminal value. */
+function dcfPerShare_(fcf0, g0, gT, r, netCash, shares) {
+  var path = growthPath_(g0, gT), cf = fcf0, pv = 0;
+  for (var t = 1; t <= 10; t++) { cf *= 1 + path[t - 1]; pv += cf / Math.pow(1 + r, t); }
+  var tv = cf * (1 + gT) / (r - gT) / Math.pow(1 + r, 10);
+  return (pv + tv + netCash) / shares;
+}
+
+/** Revenue-based 5-year projection: revenue x margin x exit multiple, per future share, discounted. */
+function projection5_(rev0, g0, gT, margin, mult, shares, dil, req) {
+  var path = growthPath_(g0, gT);
+  var rev5 = grow_(rev0, path, 5);
+  var sh5 = shares * Math.pow(1 + dil, 5);
+  var target = rev5 * margin * mult / sh5;
+  return { fv: target / Math.pow(1 + req, 5), target: target };
+}
+
+/** Solves for the year-1 growth rate that makes f(g) equal the price (f rises with g). */
+function solveGrowth_(f, price) {
+  var lo = -0.5, hi = 1.5;
+  if (f(hi) < price) return { g: null, note: 'above 150%' };
+  if (f(lo) > price) return { g: null, note: 'below -50%' };
+  for (var i = 0; i < 60; i++) { var mid = (lo + hi) / 2; if (f(mid) < price) lo = mid; else hi = mid; }
+  return { g: (lo + hi) / 2, note: '' };
+}
+
+var MODEL_NAMES = ['DCF', 'FCF future market cap', '5-yr earnings', 'Fwd EPS x P/E', 'Graham', 'Lynch', 'Dividend discount', 'Justified P/B'];
+var MODELS_BY_TYPE = {
+  'Mature': ['DCF', 'FCF future market cap', '5-yr earnings', 'Fwd EPS x P/E', 'Graham', 'Dividend discount'],
+  'Growth': ['DCF', 'FCF future market cap', '5-yr earnings', 'Fwd EPS x P/E', 'Graham', 'Lynch', 'Dividend discount'],
+  'Pre-profit': ['FCF future market cap', '5-yr earnings'],
+  'Financial': ['Justified P/B', 'Fwd EPS x P/E', 'Dividend discount']
+};
+
+/**
+ * Values one company.
+ *  raw  : Raw Data row as {header: value}
+ *  mkt  : {price, currency, beta, shares}
+ *  fx   : multiply reported-currency amounts by this to get listing currency (null = unknown)
+ *  ovr  : {type, growth, margin} per-stock overrides from Tickers (blank = none)
+ *  S    : settings (settingsFromMap_)
+ *  past : {fv, score} from ~3 months ago, or null
+ *  today: day number (dnum_)
+ */
+function valueCompany(raw, mkt, fx, ovr, S, past, today) {
+  var out = { models: {}, notes: [], signals: {} };
+  var status = String(raw.Status || '');
+  out.dataDate = raw['Latest period end'] || '';
+  if (!raw.CIK || /^(Skipped|No SEC|SEC has no|Error|Waiting)/.test(status)) {
+    out.type = /UK/.test(status) ? 'UK (later stage)' : /ETF/.test(status) ? 'ETF' : 'No SEC data';
+    return out;
+  }
+  if (out.dataDate && today - dnum_(out.dataDate) > S.maxAgeMonths * 30.4) {
+    out.type = 'Data too old';
+    out.notes.push('Latest SEC figures are for ' + out.dataDate);
+    return out;
+  }
+  if (fx === null) { out.type = 'Waiting for FX'; out.notes.push('Exchange rate for ' + raw.Currency + ' not loaded yet'); return out; }
+
+  var F = function (k) { var v = n_(raw[k]); return v === null ? null : v * fx; };
+  var price = n_(mkt.price);
+  var shares = n_(raw['Diluted shares latest']);
+  var gShares = n_(mkt.shares);
+  if (!shares && gShares) { shares = gShares; out.notes.push('Share count from Google Finance'); }
+  else if (shares && gShares && (gShares / shares > 3 || shares / gShares > 3)) {
+    shares = gShares; out.notes.push('SEC share count looked inconsistent; Google Finance count used');
+  }
+  if (!shares) { out.type = 'No share count'; return out; }
+  var shares1 = n_(raw['Diluted shares 1y ago']);
+
+  var rev = F('Revenue TTM'), rev1 = F('Revenue TTM 1y ago');
+  var ni = F('NetIncome TTM'), ni1 = F('NetIncome TTM 1y ago');
+  var ocf = F('OCF TTM'), capex = F('Capex TTM') || 0, sbc = F('SBC TTM') || 0;
+  var ocf1 = F('OCF TTM 1y ago'), capex1 = F('Capex TTM 1y ago') || 0;
+  var fcf = ocf === null ? null : ocf - capex - (S.sbc ? sbc : 0);
+  var fcf1 = ocf1 === null ? null : ocf1 - capex1;
+  var cash = (F('Cash') || 0) + (F('Short-term investments') || 0), debt = F('Total debt') || 0;
+  var netCash = cash - debt;
+  var equity = F('Equity');
+  var div = Math.abs(F('DividendsPaid TTM') || 0);
+  var eps = ni === null ? null : ni / shares;
+
+  // Revenue growth
+  var fy = function (field, i) { return F(field + ' FY' + (i === 0 ? '0' : '-' + i)); };
+  var yoy = rev && rev1 && rev1 > 0 && rev > 0 ? rev / rev1 - 1 : null;
+  var r0 = fy('Revenue', 0), r3 = fy('Revenue', 3);
+  var cagr3 = r0 && r3 && r0 > 0 && r3 > 0 ? Math.pow(r0 / r3, 1 / 3) - 1 : null;
+  out.revYoY = yoy; out.revCagr3 = cagr3;
+
+  // Classification
+  var sic = Number(raw.SIC) || 0;
+  var type;
+  var ovType = String(ovr.type || '').trim();
+  if (ovType && MODELS_BY_TYPE[ovType]) { type = ovType; out.notes.push('Type set by override'); }
+  else if (((sic >= 6000 && sic <= 6299) || sic === 6726) && !(rev && capex / rev > 0.1)) type = 'Financial';
+  else if (ni === null || ni <= 0) type = 'Pre-profit';
+  else if ((mean_([yoy, cagr3]) || 0) >= S.growthThreshold) type = 'Growth';
+  else type = 'Mature';
+  out.type = type;
+
+  // Starting growth, path and discount rate
+  var g0, basis;
+  var ovG = n_(ovr.growth);
+  if (ovG !== null) { g0 = ovG > 1.5 ? ovG / 100 : ovG; basis = 'Override'; }
+  else {
+    var avg = mean_([yoy, cagr3]);
+    g0 = avg === null ? S.gTerm : avg;
+    basis = yoy !== null && cagr3 !== null ? 'Avg of 1-yr and 3-yr revenue growth' : yoy !== null ? '1-yr revenue growth' : cagr3 !== null ? '3-yr revenue growth' : 'No history (terminal rate)';
+  }
+  var g0raw = g0;
+  g0 = clamp_(g0, S.gFloor, S.gCap);
+  if (g0 !== g0raw && basis !== 'Override') basis += g0raw > g0 ? ' (capped)' : ' (floored)';
+  var gT = S.gTerm, path = growthPath_(g0, gT);
+  var avgRange = function (a, b) { return mean_(path.slice(a - 1, b)); };
+  out.g0 = g0; out.gBasis = basis;
+
+  var beta = n_(mkt.beta);
+  if (beta === null) { beta = S.betaDefault; out.notes.push('No beta; ' + beta + ' assumed'); }
+  var r = clamp_(S.rf + clamp_(beta, S.betaMin, S.betaMax) * S.erp, S.rMin, S.rMax);
+  if (r - gT < 0.02) r = gT + 0.02;
+  out.r = r;
+
+  // Margins
+  var margins = function (num) {
+    var a = [];
+    for (var i = 0; i <= 2; i++) { var x = num(i), rv = fy('Revenue', i); if (x !== null && rv) a.push(x / rv); }
+    return mean_(a);
+  };
+  var fcfMarginNow = fcf !== null && rev ? fcf / rev : null;
+  var fcfMarginAvg = margins(function (i) { var o = fy('OCF', i), c = fy('Capex', i) || 0; return o === null ? null : o - c; });
+  var netMarginNow = ni !== null && rev ? ni / rev : null;
+  var netMarginAvg = margins(function (i) { return fy('NetIncome', i); });
+  var ovM = n_(ovr.margin);
+  if (ovM !== null && ovM > 1.5) ovM = ovM / 100;
+  // Long-run margins: average of the latest 12 months and the last 3 fiscal years
+  // (averaging tempers peak-cycle margins).
+  var mF = ovM !== null ? ovM : mean_([fcfMarginNow, fcfMarginAvg]);
+  if (ovM === null && (mF === null || mF <= 0) && netMarginNow > 0) mF = mean_([netMarginNow, netMarginAvg > 0 ? netMarginAvg : null]);
+  if (mF === null || mF <= 0) { mF = S.defFcfMargin; if (ovM === null) out.notes.push('Default FCF margin used'); }
+  var mN = ovM !== null ? ovM : mean_([netMarginNow, netMarginAvg]);
+  if (mN === null || mN <= 0) { mN = S.defNetMargin; if (ovM === null) out.notes.push('Default net margin used'); }
+  mF = Math.min(mF, 0.6); mN = Math.min(mN, 0.6);
+
+  // Possible cyclical peak: an established company (revenue >= 5bn three years ago) in a cyclical industry, revenue up >50% in a year AND net margin
+  // more than double last year's. Valuing peak profits with growth on top overstates value,
+  // so margins revert to the cycle average (this year + 3 prior) and growth starts at terminal.
+  var prevNet = [];
+  for (var pi = 1; pi <= 3; pi++) { var pn = fy('NetIncome', pi), pr = fy('Revenue', pi); if (pn !== null && pr) prevNet.push(pn / pr); }
+  var lastYear = prevNet.length ? prevNet[0] : null;
+  var cyclicalSic = (sic >= 1000 && sic <= 1499) || (sic >= 2800 && sic <= 2999) || (sic >= 3300 && sic <= 3399) ||
+    (sic >= 3670 && sic <= 3679) || (sic >= 3711 && sic <= 3716) || (sic >= 4400 && sic <= 4499);
+  var established = (fy('Revenue', 3) || 0) >= 5e9;
+  var peak = cyclicalSic && established && ovG === null && ovM === null && yoy !== null && yoy > 0.5 && netMarginNow !== null &&
+    lastYear !== null && netMarginNow > 0 && netMarginNow > 2 * Math.max(lastYear, 0.02);
+  out.cyclicalPeak = peak;
+  var fcfBase = fcf, epsBase = eps;
+  if (peak) {
+    var cycNet = mean_([netMarginNow].concat(prevNet)), cycFcf = mean_([fcfMarginNow, fcfMarginAvg]);
+    mN = Math.max(cycNet, 0.01); mF = Math.max(cycFcf || cycNet, 0.01);
+    fcfBase = rev * mF; epsBase = rev * mN / shares;
+    g0 = gT; path = growthPath_(g0, gT); out.g0 = g0;
+    out.gBasis = 'Cyclical peak: no growth assumed';
+    out.notes.push('Possible cyclical peak: average-cycle margins and no growth used (override on Tickers to change)');
+  }
+
+  // Dilution (ignores share-count jumps that look like splits)
+  var dil = null;
+  if (shares1) { var ratio = shares / shares1; if (ratio > 0.6 && ratio < 1.6) dil = ratio - 1; }
+  out.dilution = dil;
+  var dilP = dil === null ? 0 : clamp_(dil, -0.05, 0.15);
+
+  var allowed = MODELS_BY_TYPE[type];
+  var M = {};
+  var hasRev = rev !== null && rev >= 25e6;
+  var peLater = exitMultiple_(avgRange(6, 10), S.peCap);
+  var pfLater = exitMultiple_(avgRange(6, 10), S.pfcfCap);
+
+  if (fcfBase !== null && fcfBase > 0 && type !== 'Financial') M['DCF'] = dcfPerShare_(fcfBase, g0, gT, r, netCash, shares);
+  if (hasRev && type !== 'Financial') {
+    M['FCF future market cap'] = projection5_(rev, g0, gT, mF, pfLater, shares, dilP, S.req).fv;
+    var p5 = projection5_(rev, g0, gT, mN, peLater, shares, dilP, S.req);
+    M['5-yr earnings'] = p5.fv;
+    out.target5 = p5.target;
+  }
+  if (epsBase !== null && epsBase > 0) {
+    var eps2 = epsBase * (1 + path[0]) * (1 + path[1]);
+    M['Fwd EPS x P/E'] = eps2 * exitMultiple_(avgRange(3, 7), S.peCap) / Math.pow(1 + S.req, 2);
+    var gG = Math.min(avgRange(1, 10) * 100, 15);
+    if (S.aaa > 0) M['Graham'] = epsBase * (8.5 + 2 * gG) * 4.4 / (S.aaa * 100);
+    var gL = Math.min(avgRange(1, 5) * 100, 25);
+    if (gL >= 5) M['Lynch'] = epsBase * gL;
+  }
+  if (price && div > 0 && div / (price * shares) >= 0.015) {
+    var gD = Math.min(avgRange(1, 10), r - 0.02, 0.06);
+    M['Dividend discount'] = div / shares * (1 + gD) / (r - gD);
+  }
+  if (equity && equity > 0 && ni !== null) {
+    var roe = ni / equity;
+    if (roe > gT) M['Justified P/B'] = equity / shares * (roe - gT) / (r - gT);
+  }
+  if (type === 'Financial' && eps !== null && eps > 0) {
+    out.target5 = eps * Math.pow(1 + mean_(path.slice(0, 5)), 5) * exitMultiple_(avgRange(6, 10), S.peCap);
+  }
+
+  // Blend: models allowed for the type, positive, and within 0.2x-5x of price.
+  var used = [], excluded = [];
+  MODEL_NAMES.forEach(function (name) {
+    var v = M[name];
+    out.models[name] = v === undefined || !isFinite(v) ? null : v;
+    if (out.models[name] === null || allowed.indexOf(name) < 0) return;
+    if (v <= 0 || (price && (v < 0.2 * price || v > 5 * price))) { excluded.push(name); return; }
+    used.push(name);
+  });
+  var vals = used.map(function (k) { return M[k]; });
+  if (vals.length) {
+    out.fv = median_(vals); out.low = Math.min.apply(null, vals); out.high = Math.max.apply(null, vals);
+    out.buyBelow = out.fv * (1 - S.mos);
+  }
+  out.used = used;
+  if (excluded.length) out.notes.push('Excluded as implausible vs price: ' + excluded.join(', '));
+  if (type === 'Pre-profit') out.notes.push('Speculative: values rest on assumed future margins');
+
+  // Reverse DCF: what year-1 growth (fading to terminal) the price implies
+  if (price) {
+    var sol = null;
+    if (fcfBase !== null && fcfBase > 0 && type !== 'Financial') {
+      sol = solveGrowth_(function (g) { return dcfPerShare_(fcfBase, g, gT, r, netCash, shares); }, price);
+      out.impliedBasis = 'DCF';
+    } else if (hasRev && type !== 'Financial') {
+      sol = solveGrowth_(function (g) { return projection5_(rev, g, gT, mF, pfLater, shares, dilP, S.req).fv; }, price);
+      out.impliedBasis = 'Revenue projection';
+    }
+    if (sol) { out.implied = sol.g; out.impliedNote = sol.note; }
+  }
+
+  // Metrics
+  out.divYield = price && div ? div / (price * shares) : 0;
+  out.grossMargin = F('GrossProfit TTM') !== null && rev ? F('GrossProfit TTM') / rev : null;
+  out.opMargin = F('OperatingIncome TTM') !== null && rev ? F('OperatingIncome TTM') / rev : null;
+  out.fcfMargin = fcfMarginNow;
+  out.netCash = netCash;
+  out.pe = price && eps > 0 ? price / eps : null;
+  out.evSales = price && rev ? (price * shares - netCash) / rev : null;
+  out.runway = fcf !== null && fcf < 0 ? cash / -fcf * 12 : null;
+  var opInc = F('OperatingIncome TTM'), tax = F('IncomeTax TTM'), pre = F('PretaxIncome TTM');
+  var tr = tax !== null && pre ? clamp_(tax / pre, 0, 0.35) : 0.21;
+  var ic = (equity || 0) + debt - cash;
+  out.roic = opInc !== null && ic > 0 ? opInc * (1 - tr) / ic : null;
+
+  // Direction signals: true = improving, false = worsening, null = not available
+  var sig = out.signals;
+  sig.Revenue = yoy === null ? null : cagr3 !== null ? yoy >= cagr3 - 0.02 : yoy > 0;
+  sig.EPS = ni !== null && ni1 !== null ? (shares1 && dil !== null ? ni / shares > ni1 / shares1 : ni > ni1) : null;
+  sig.FCF = fcf !== null && fcf1 !== null ? fcf > fcf1 : null;
+  var gmAvg = margins(function (i) { return fy('GrossProfit', i); });
+  sig['Gross margin'] = out.grossMargin !== null && gmAvg !== null ? out.grossMargin >= gmAvg : null;
+  var omAvg = margins(function (i) { return fy('OperatingIncome', i); });
+  sig['Op margin'] = out.opMargin !== null && omAvg !== null ? out.opMargin >= omAvg : null;
+  sig.Shares = dil === null ? null : dil <= 0.01;
+  var opInc1 = F('OperatingIncome TTM 1y ago');
+  sig.ROIC = out.roic !== null && out.roic >= 0.15 ? true : opInc !== null && opInc1 !== null ? opInc > opInc1 : null;
+  sig['Fair value'] = past && past.fv && out.fv ? out.fv >= past.fv : null;
+  var keys = Object.keys(sig), avail = keys.filter(function (k) { return sig[k] !== null; });
+  out.score = avail.filter(function (k) { return sig[k]; }).length;
+  out.scoreOf = avail.length;
+  out.scorePct = avail.length ? out.score / avail.length : null;
+  out.scoreChange = past && past.score !== null && past.score !== undefined && past.score !== '' ? out.score - past.score : null;
+  out.signalText = keys.map(function (k) { return k + (sig[k] === null ? ' –' : sig[k] ? ' ↑' : ' ↓'); }).join('  ');
+  return out;
+}
+
+/* ======================================================================== */
+/*  STAGE 2 — SHEET WIRING: Calc, Watchlist, History, FX, rates             */
+/* ======================================================================== */
+
+var SHEET2 = { CALC: 'Calc', WATCH: 'Watchlist', HIST: 'History', FX: 'FX' };
+
+function colL_(n) { var s = ''; while (n > 0) { var m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = (n - m - 1) / 26; } return s; }
+
+/* Calc columns: [header, number format, value key or formula builder]. */
+var CALC_COLS = [
+  ['Ticker', '@', 'ticker'], ['Name', '@', 'name'], ['List', '@', 'list'], ['Type', '@', 'type'],
+  ['Price', '#,##0.00', 'F:price'], ['Currency', '@', 'ccy'],
+  ['Fair value', '#,##0.00', 'fv'], ['Low', '#,##0.00', 'low'], ['High', '#,##0.00', 'high'], ['Buy below', '#,##0.00', 'buyBelow'],
+  ['Upside', '0.0%;[Red]-0.0%', 'F:upside'], ['Price / fair value', '0.00', 'F:pfv'],
+  ['Exp. 5-yr return (a year)', '0.0%;[Red]-0.0%', 'F:expret'],
+  ['Status', '@', 'F:status'], ['Watch signal', '@', 'F:signal'],
+  ['Direction', '@', 'dirText'], ['Direction %', '0%', 'scorePct'], ['Direction change (3 months)', '+0;-0;0', 'scoreChange'],
+  ['Signals', '@', 'signalText'], ['Models used', '0', 'usedCount'], ['Models', '@', 'usedNames'],
+  ['Implied growth (reverse DCF)', '0.0%', 'implied'], ['Start growth', '0.0%', 'g0'], ['Growth basis', '@', 'gBasis'],
+  ['Discount rate', '0.0%', 'r'],
+  ['DCF', '#,##0.00', 'm:DCF'], ['FCF future market cap', '#,##0.00', 'm:FCF future market cap'],
+  ['5-yr earnings', '#,##0.00', 'm:5-yr earnings'], ['Fwd EPS x P/E', '#,##0.00', 'm:Fwd EPS x P/E'],
+  ['Graham', '#,##0.00', 'm:Graham'], ['Lynch', '#,##0.00', 'm:Lynch'], ['Dividend discount', '#,##0.00', 'm:Dividend discount'],
+  ['Justified P/B', '#,##0.00', 'm:Justified P/B'],
+  ['5-yr target price', '#,##0.00', 'target5'], ['Dividend yield', '0.0%', 'divYield'],
+  ['Revenue growth 1-yr', '0.0%;[Red]-0.0%', 'revYoY'], ['Revenue growth 3-yr CAGR', '0.0%;[Red]-0.0%', 'revCagr3'],
+  ['Gross margin', '0.0%;[Red]-0.0%', 'grossMargin'], ['Operating margin', '0.0%;[Red]-0.0%', 'opMargin'],
+  ['FCF margin', '0.0%;[Red]-0.0%', 'fcfMargin'], ['ROIC', '0.0%;[Red]-0.0%', 'roic'],
+  ['Net cash (m)', '#,##0;[Red]-#,##0', 'netCashM'], ['EV / sales', '0.0', 'evSales'], ['P/E (TTM)', '0.0', 'pe'],
+  ['Cash runway (months)', '0', 'runway'], ['Dilution 1-yr', '0.0%;[Red]-0.0%', 'dilution'],
+  ['Data as of', '@', 'dataDate'], ['Notes', '@', 'notesText'], ['Sort key', '0.000', 'F:sort']
+];
+function calcIdx_(header) { for (var i = 0; i < CALC_COLS.length; i++) if (CALC_COLS[i][0] === header) return i + 1; throw new Error(header); }
+function calcL_(header) { return colL_(calcIdx_(header)); }
+
+function calcFormula_(key, r) {
+  var c = function (h) { return calcL_(h) + r; };
+  var P = c('Price'), G = c('Fair value'), H = c('High'), J = c('Buy below');
+  switch (key) {
+    case 'price': return '=IFERROR(VLOOKUP($A' + r + ',Market!$A:$D,4,FALSE),"")';
+    case 'upside': return '=IF(OR(' + G + '="",' + P + '="",' + P + '=0),"",' + G + '/' + P + '-1)';
+    case 'pfv': return '=IF(OR(' + G + '="",' + P + '=""),"",' + P + '/' + G + ')';
+    case 'expret':
+      var T = c('5-yr target price'), Y = c('Dividend yield');
+      return '=IF(OR(' + T + '="",' + P + '="",N(' + P + ')<=0,N(' + T + ')<=0),"",(' + T + '/' + P + ')^(1/5)-1+N(' + Y + '))';
+    case 'status':
+      var M = c('Exp. 5-yr return (a year)');
+      return '=IF(OR(' + G + '="",' + P + '=""),"No valuation",IF(OR(' + P + '>' + H + ',AND(' + M + '<>"",' + M + '<STRETCH_RETURN)),"Stretched",IF(' + P + '>' + G + ',"Above fair value",IF(' + P + '>=' + J + ',"Fair","Cheap"))))';
+    case 'signal':
+      var D = c('Type'), Q = c('Direction %'), U = c('Models used');
+      return '=IF(' + D + '="Pre-profit","Speculative",IF(OR(' + G + '="",' + P + '=""),"No valuation",IF(AND(' + P + '<=' + J + ',N(' + Q + ')>=0.6,N(' + U + ')>=3),"Buy zone",IF(AND(' + P + '<=' + J + ',N(' + Q + ')<=0.4),"Value trap?",IF(' + P + '<=' + J + '*1.1,"Approaching","Wait")))))';
+    case 'sort': return '=IF(' + c('Upside') + '="",-99,' + c('Upside') + ')';
+  }
+}
+
+/** Recalculates every valuation. Runs after each data load, and when settings or overrides change. */
+function recalcValuations() {
+  var ss = SpreadsheetApp.getActive();
+  var today = dnum_(Utilities.formatDate(new Date(), 'UTC', 'yyyy-MM-dd'));
+  var S = settingsFromMap_(assumptionsMap_());
+
+  var raw = sheetObjects_(SHEET.RAW, 'Ticker');
+  var mk = ss.getSheetByName(SHEET.MARKET);
+  var mv = mk.getLastRow() > 1 ? mk.getRange(2, 1, mk.getLastRow() - 1, MARKET_HEADERS.length).getValues() : [];
+  var market = {};
+  mv.forEach(function (r) {
+    var cur = String(r[4] || '').trim();
+    market[String(r[0]).toUpperCase()] = { name: typeof r[2] === 'string' && r[2].charAt(0) !== '=' ? r[2] : '', price: typeof r[3] === 'number' ? r[3] : null,
+      currency: /^[A-Z]{3}$/.test(cur) ? cur : '',
+      shares: typeof r[6] === 'number' ? r[6] : null, beta: typeof r[7] === 'number' ? r[7] : null };
+  });
+  var tk = ss.getSheetByName(SHEET.TICKERS);
+  var tv = tk.getLastRow() > 1 ? tk.getRange(2, 1, tk.getLastRow() - 1, 7).getValues() : [];
+  var hist = historyIndex_(today);
+
+  // Exchange rates: reported currency -> listing currency
+  var need = {};
+  tv.forEach(function (r) {
+    var t = String(r[0]).trim().toUpperCase(), rw = raw[t], m = market[t];
+    if (rw && rw.Currency && m && m.currency && rw.Currency !== m.currency) need[rw.Currency + m.currency] = 1;
+  });
+  var fx = fxRates_(Object.keys(need));
+
+  var out = [];
+  tv.forEach(function (r) {
+    var t = String(r[0]).trim().toUpperCase();
+    if (!t) return;
+    var rw = raw[t] || { Ticker: t, Status: 'Waiting for data' }, m = market[t] || {};
+    var rate = !rw.Currency || !m.currency || rw.Currency === m.currency ? 1 : (fx[rw.Currency + m.currency] || null);
+    var v;
+    try {
+      v = valueCompany(rw, m, rate, { type: r[4], growth: r[5], margin: r[6] }, S, hist[t] || null, today);
+    } catch (e) { v = { type: 'Error', notes: [e.message], models: {}, signals: {} }; }
+    v.ticker = t; v.name = m.name || rw['SEC name'] || ''; v.list = r[3] || ''; v.ccy = m.currency || '';
+    v.dirText = v.scoreOf ? v.score + '/' + v.scoreOf : '';
+    v.usedCount = v.used ? v.used.length : '';
+    v.usedNames = v.used ? v.used.join(', ') : '';
+    v.netCashM = v.netCash === undefined || v.netCash === null ? '' : v.netCash / 1e6;
+    if (v.implied === null && v.impliedNote) v.implied = v.impliedNote;
+    v.notesText = (v.notes || []).join('; ');
+    out.push(v);
+  });
+
+  var sh = ensureSheet_(SHEET2.CALC, CALC_COLS.map(function (c) { return c[0]; }));
+  sh.setFrozenColumns(1);
+  if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, CALC_COLS.length).clearContent();
+  if (!out.length) return;
+  var rows = out.map(function (v, i) {
+    var r = i + 2;
+    return CALC_COLS.map(function (c) {
+      var key = c[2];
+      if (key.indexOf('F:') === 0) return calcFormula_(key.slice(2), r);
+      var val = key.indexOf('m:') === 0 ? (v.models || {})[key.slice(2)] : v[key];
+      return val === undefined || val === null || (typeof val === 'number' && !isFinite(val)) ? '' : val;
+    });
+  });
+  sh.getRange(2, 1, rows.length, CALC_COLS.length).setValues(rows);
+  CALC_COLS.forEach(function (c, i) { sh.getRange(2, i + 1, rows.length, 1).setNumberFormat(c[1]); });
+
+  snapshotHistory_(out, today);
+}
+
+function assumptionsMap_() {
+  var sh = SpreadsheetApp.getActive().getSheetByName(SHEET.ASSUME), m = {};
+  if (sh.getLastRow() < 1) return m;
+  sh.getRange(1, 1, sh.getLastRow(), 2).getValues().forEach(function (r) { m[String(r[0]).trim()] = r[1]; });
+  return m;
+}
+
+function sheetObjects_(name, key) {
+  var sh = SpreadsheetApp.getActive().getSheetByName(name), out = {};
+  if (!sh || sh.getLastRow() < 2) return out;
+  var v = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues(), h = v[0];
+  v.slice(1).forEach(function (r) {
+    var o = {};
+    h.forEach(function (x, i) { o[x] = r[i] instanceof Date ? Utilities.formatDate(r[i], 'UTC', 'yyyy-MM-dd') : r[i]; });
+    if (o[key]) out[String(o[key]).toUpperCase()] = o;
+  });
+  return out;
+}
+
+/** FX tab: one GOOGLEFINANCE rate per currency pair needed (e.g. EURUSD). */
+function fxRates_(pairs) {
+  var sh = ensureSheet_(SHEET2.FX, ['Pair', 'Rate']);
+  var have = sh.getLastRow() > 1 ? sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues() : [];
+  var known = have.map(function (r) { return String(r[0]); });
+  var add = pairs.filter(function (p) { return /^[A-Z]{6}$/.test(p) && known.indexOf(p) < 0; });
+  if (add.length) {
+    var start = have.length + 2;
+    sh.getRange(start, 1, add.length, 2).setValues(add.map(function (p, k) {
+      return [p, '=GOOGLEFINANCE("CURRENCY:' + p + '")'];
+    }));
+    SpreadsheetApp.flush();
+    have = sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues();
+  }
+  var out = {};
+  have.forEach(function (r) { if (typeof r[1] === 'number' && r[1] > 0) out[String(r[0])] = r[1]; });
+  return out;
+}
+
+/** History: weekly snapshot of price, fair value and direction score per ticker. */
+function historyIndex_(today) {
+  var sh = ensureSheet_(SHEET2.HIST, ['Date', 'Ticker', 'Price', 'Fair value', 'Direction score']);
+  var out = {};
+  if (sh.getLastRow() < 2) return out;
+  sh.getRange(2, 1, sh.getLastRow() - 1, 5).getValues().forEach(function (r) {
+    var d = r[0] instanceof Date ? dnum_(Utilities.formatDate(r[0], 'UTC', 'yyyy-MM-dd')) : null;
+    if (d === null) return;
+    var age = today - d;
+    if (age < 60 || age > 120) return;
+    var t = String(r[1]).toUpperCase(), cur = out[t];
+    if (!cur || Math.abs(age - 90) < Math.abs(cur.age - 90)) out[t] = { age: age, fv: typeof r[3] === 'number' ? r[3] : null, score: r[4] };
+  });
+  return out;
+}
+
+function snapshotHistory_(rows, today) {
+  var sh = SpreadsheetApp.getActive().getSheetByName(SHEET2.HIST);
+  var last = sh.getLastRow() > 1 ? sh.getRange(sh.getLastRow(), 1).getValue() : null;
+  var lastDay = last instanceof Date ? dnum_(Utilities.formatDate(last, 'UTC', 'yyyy-MM-dd')) : -1;
+  if (today - lastDay < 7) return;
+  var mk = {};
+  var mv = SpreadsheetApp.getActive().getSheetByName(SHEET.MARKET);
+  if (mv.getLastRow() > 1) mv.getRange(2, 1, mv.getLastRow() - 1, 4).getValues().forEach(function (r) { mk[String(r[0]).toUpperCase()] = r[3]; });
+  var now = new Date();
+  var add = rows.filter(function (v) { return v.fv; }).map(function (v) {
+    return [now, v.ticker, typeof mk[v.ticker] === 'number' ? mk[v.ticker] : '', v.fv, v.score === undefined ? '' : v.score];
+  });
+  if (add.length) sh.getRange(sh.getLastRow() + 1, 1, add.length, 5).setValues(add);
+}
+
+/** Bond yields from data/rates.csv (written by the GitHub job from FRED). */
+function loadRates_(rawUrl) {
+  try {
+    var url = rawUrl.replace(/raw_data\.csv.*$/, 'rates.csv');
+    var res = UrlFetchApp.fetch(url + '?t=' + Date.now(), { muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) return;
+    var rows = Utilities.parseCsv(res.getContentText()), vals = {};
+    rows.slice(1).forEach(function (r) { vals[r[0]] = Number(r[2]) / 100; });
+    var sh = SpreadsheetApp.getActive().getSheetByName(SHEET.ASSUME);
+    var labels = sh.getRange(1, 1, sh.getLastRow(), 1).getValues();
+    labels.forEach(function (l, i) {
+      var lab = String(l[0]).trim();
+      if (lab === 'Risk-free rate (10-yr Treasury)' && vals.DGS10 > 0) sh.getRange(i + 1, 2).setValue(vals.DGS10);
+      if (lab === 'AAA corporate bond yield' && vals.AAA > 0) sh.getRange(i + 1, 2).setValue(vals.AAA);
+    });
+  } catch (e) { log_('', 'Could not load bond yields: ' + e.message); }
+}
+
+/** Adds any missing Stage 2 settings rows to Assumptions (existing values are kept). */
+function ensureSettings_() {
+  var sh = SpreadsheetApp.getActive().getSheetByName(SHEET.ASSUME);
+  var have = assumptionsMap_();
+  var start = sh.getLastRow() + 1, added = 0;
+  if (!('Valuation settings' in have)) {
+    sh.getRange(start + 1, 1).setValue('Valuation settings').setFontWeight('bold');
+    start += 2;
+  }
+  SETTINGS.forEach(function (s) {
+    if (s[0] in have) return;
+    var r = start + added;
+    sh.getRange(r, 1, 1, 3).setValues([[s[0], s[1], s[3]]]);
+    sh.getRange(r, 2).setNumberFormat(s[2]).setBackground('#FFF4CC');
+    added++;
+  });
+  nameSetting_('Stretched if 5-yr expected return below', 'STRETCH_RETURN');
+}
+
+/** Holdings: valuation columns to the right of the existing ones. */
+function writeHoldingsValuation_() {
+  var sh = SpreadsheetApp.getActive().getSheetByName(SHEET.HOLDINGS);
+  var heads = ['Type', 'Fair value (local)', 'Low', 'High', 'Upside', 'Exp. 5-yr return', 'Direction', 'Status', 'Review'];
+  sh.getRange(1, 14, 1, heads.length).setValues([heads]).setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#1F3A5F').setWrap(true);
+  var last = colL_(CALC_COLS.length);
+  var look = function (h) { return 'IFERROR(VLOOKUP(A2:A,Calc!$A:$' + last + ',' + calcIdx_(h) + ',FALSE),"")'; };
+  var f = {
+    N2: look('Type'), O2: look('Fair value'), P2: look('Low'), Q2: look('High'), R2: look('Upside'),
+    S2: look('Exp. 5-yr return (a year)'), T2: look('Direction'), U2: look('Status')
+  };
+  Object.keys(f).forEach(function (a1) { sh.getRange(a1).setFormula('=ARRAYFORMULA(IF(A2:A="",,' + f[a1] + '))'); });
+  sh.getRange('V2').setFormula('=ARRAYFORMULA(IF(A2:A="",,TRIM(IF(N(M2:M)>0.15,"Over 15% of portfolio. ","")&IF(N(' +
+    look('Direction change (3 months)') + ')<=-2,"Direction score fell 2+ in 3 months.",""))))');
+  var fmt = { O: '#,##0.00', P: '#,##0.00', Q: '#,##0.00', R: '0.0%;[Red]-0.0%', S: '0.0%;[Red]-0.0%' };
+  Object.keys(fmt).forEach(function (c) { sh.getRange(c + '2:' + c + '500').setNumberFormat(fmt[c]); });
+  [14, 15, 16, 17, 18, 19, 20, 21, 22].forEach(function (c, i) { sh.setColumnWidth(c, [110, 90, 80, 80, 70, 80, 70, 120, 240][i]); });
+}
+
+/** Watchlist: watched (not held) stocks, best upside first. */
+function writeWatchlist_() {
+  var heads = ['Ticker', 'Name', 'Type', 'Price', 'Currency', 'Fair value', 'Buy below', 'Upside', 'Exp. 5-yr return',
+    'Direction', 'Signal', 'Implied growth', 'Cash runway (months)', 'Dilution 1-yr', 'Notes'];
+  var sh = ensureSheet_(SHEET2.WATCH, heads);
+  sh.getRange(1, 1, 1, heads.length).setFontColor('#FFFFFF').setBackground('#1F3A5F').setWrap(true);
+  var cols = ['Ticker', 'Name', 'Type', 'Price', 'Currency', 'Fair value', 'Buy below', 'Upside', 'Exp. 5-yr return (a year)',
+    'Direction', 'Watch signal', 'Implied growth (reverse DCF)', 'Cash runway (months)', 'Dilution 1-yr', 'Notes'];
+  var arr = '{' + cols.map(function (h) { return 'Calc!' + calcL_(h) + '2:' + calcL_(h); }).join(',') + '}';
+  var cond = 'Calc!C2:C="Watchlist"';
+  sh.getRange('A2').setFormula('=IFERROR(SORT(FILTER(' + arr + ',' + cond + '),FILTER(Calc!' + calcL_('Sort key') + '2:' +
+    calcL_('Sort key') + ',' + cond + '),FALSE),"Run Valuation ▸ Recalculate valuations")');
+  var fmt = { D: '#,##0.00', F: '#,##0.00', G: '#,##0.00', H: '0.0%;[Red]-0.0%', I: '0.0%;[Red]-0.0%', L: '0.0%', M: '0', N: '0.0%;[Red]-0.0%' };
+  Object.keys(fmt).forEach(function (c) { sh.getRange(c + '2:' + c + '500').setNumberFormat(fmt[c]); });
+  sh.setColumnWidth(2, 200); sh.setColumnWidth(15, 360);
+}
+
+/** Colours for Status and Signal columns. */
+function writeColourRules_() {
+  var ss = SpreadsheetApp.getActive();
+  var colours = { 'Stretched': '#F4C7C3', 'Above fair value': '#FCE8B2', 'Fair': '#E8EAED', 'Cheap': '#B7E1CD',
+    'Buy zone': '#B7E1CD', 'Approaching': '#D9EAD3', 'Value trap?': '#FCE8B2', 'Speculative': '#D9D2E9' };
+  var apply = function (sh, a1) {
+    var range = sh.getRange(a1);
+    var rules = sh.getConditionalFormatRules().filter(function (r) {
+      return !r.getRanges().some(function (x) { return x.getA1Notation() === range.getA1Notation(); });
+    });
+    Object.keys(colours).forEach(function (k) {
+      rules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(k).setBackground(colours[k]).setRanges([range]).build());
+    });
+    sh.setConditionalFormatRules(rules);
+  };
+  apply(ss.getSheetByName(SHEET.HOLDINGS), 'U2:U500');
+  apply(ss.getSheetByName(SHEET2.WATCH), 'K2:K500');
+  apply(ss.getSheetByName(SHEET2.CALC), calcL_('Status') + '2:' + calcL_('Watch signal') + '500');
+}
+
 /* Lets the parsing functions be tested outside Google (ignored by Apps Script). */
 if (typeof module !== 'undefined') {
-  module.exports = { TAGS: TAGS, parseCompany: parseCompany, parseCsv: parseCsv, buildRawRows: buildRawRows, RAW_COLS: RAW_COLS };
+  module.exports = { TAGS: TAGS, valueCompany: valueCompany, settingsFromMap_: settingsFromMap_, dnum_: dnum_, CALC_COLS: CALC_COLS, parseCompany: parseCompany, parseCsv: parseCsv, buildRawRows: buildRawRows, RAW_COLS: RAW_COLS };
 }

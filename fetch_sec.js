@@ -139,6 +139,18 @@ async function main() {
   const lines = [RAW_COLS.map(csvCell).join(',')]
     .concat(rows.map(r => RAW_COLS.map(c => csvCell(r[c])).join(',')));
   fs.writeFileSync(path.join(OUT_DIR, 'raw_data.csv'), lines.join('\n') + '\n');
+  // Bond yields from FRED (10-year Treasury, Moody's AAA corporate), for the sheet's discount rates.
+  const rates = ['series,date,value'];
+  for (const id of ['DGS10', 'AAA']) {
+    try {
+      const res = await fetch(`https://fred.stlouisfed.org/graph/fredgraph.csv?id=${id}`);
+      const lines = (await res.text()).trim().split('\n').slice(1).filter(l => /,\d/.test(l));
+      const last = lines[lines.length - 1].split(',');
+      rates.push(`${id},${last[0]},${last[1]}`);
+      console.log(`${id} ${last[0]} ${last[1]}%`);
+    } catch (e) { console.log(`Could not fetch ${id} from FRED: ${e.message}`); }
+  }
+  if (rates.length > 1) fs.writeFileSync(path.join(OUT_DIR, 'rates.csv'), rates.join('\n') + '\n');
   const ok = rows.filter(r => r.Status === 'OK').length;
   console.log(`\nWrote ${rows.length} rows (${ok} OK) to raw_data.csv`);
 }
