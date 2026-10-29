@@ -1,25 +1,19 @@
-// One-off test: what does the FMP free plan return? Writes data/fmp_probe.json (no key in output).
+// One-off test: which tickers does the FMP free plan cover for analyst estimates?
+// Saves covered tickers' estimates to data/fmp/ and a coverage list (no key in output).
 const fs = require('fs');
 const KEY = process.env.FMP_KEY || '';
-const B = 'https://financialmodelingprep.com';
-const eps = [
-  ['estimates', s => `${B}/stable/analyst-estimates?symbol=${s}&period=annual&page=0&limit=10`],
-  ['target-consensus', s => `${B}/stable/price-target-consensus?symbol=${s}`],
-  ['grades-consensus', s => `${B}/stable/grades-consensus?symbol=${s}`],
-  ['profile', s => `${B}/stable/profile?symbol=${s}`],
-  ['v3-estimates', s => `${B}/api/v3/analyst-estimates/${s}?limit=4`],
-];
+const rows = fs.readFileSync('data/raw_data.csv', 'utf8').split('\n').slice(1).map(l => l.split(','));
+const tickers = rows.filter(r => r[3] && /^\d+$/.test(r[3])).map(r => r[0]);
 (async () => {
-  const out = { keySet: KEY.length > 0, results: [] };
-  for (const s of ['AAPL', 'NVDA', 'SOUN', 'ASML', 'IREN']) for (const [name, u] of eps) {
-    try {
-      const url = u(s) + (u(s).includes('?') ? '&' : '?') + 'apikey=' + KEY;
-      const r = await fetch(url); const t = await r.text();
-      out.results.push({ symbol: s, endpoint: name, status: r.status, body: t.slice(0, 900).split(KEY).join('***') });
-    } catch (e) { out.results.push({ symbol: s, endpoint: name, error: e.message }); }
-    await new Promise(r => setTimeout(r, 300));
+  fs.mkdirSync('data/fmp', { recursive: true });
+  const cov = [];
+  for (const s of tickers) {
+    const r = await fetch(`https://financialmodelingprep.com/stable/analyst-estimates?symbol=${s}&period=annual&page=0&limit=10&apikey=${KEY}`);
+    const t = await r.text();
+    cov.push(`${s},${r.status}`);
+    if (r.status === 200) fs.writeFileSync(`data/fmp/${s}.json`, t);
+    await new Promise(r => setTimeout(r, 250));
   }
-  fs.mkdirSync('data', { recursive: true });
-  fs.writeFileSync('data/fmp_probe.json', JSON.stringify(out, null, 1));
-  console.log(out.results.map(x => `${x.symbol} ${x.endpoint} ${x.status}`).join('\n'));
+  fs.writeFileSync('data/fmp_coverage.csv', 'ticker,status\n' + cov.join('\n') + '\n');
+  console.log(cov.filter(c => c.endsWith(',200')).length + ' of ' + cov.length + ' covered');
 })();

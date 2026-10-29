@@ -16,5 +16,5 @@ jobs:
       - run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/fmp_probe.json
-          git commit -m "FMP probe results" && git push
+          git add data/fmp data/fmp_coverage.csv
+          git commit -m "FMP coverage probe" && git push
