@@ -216,13 +216,15 @@ async function yahooRow(ticker, sym, idTag) {
   const yf = await yahoo();
   const row = { Ticker: ticker, CIK: idTag, 'Filer form': idTag === 'LSE' ? 'Yahoo Finance (LSE)' : 'Yahoo Finance', Accounting: idTag === 'LSE' ? 'IFRS' : '' };
   try {
+    const qs = await yf.quoteSummary(sym, { modules: ['assetProfile', 'price', 'financialData'] }, { validateResult: false });
+    await sleep(300);
+    const qt = String((qs.price && qs.price.quoteType) || '').toUpperCase();
+    if (qt === 'ETF' || qt === 'MUTUALFUND') return { Ticker: ticker, Status: 'Skipped: ETF (not valued)' };
     const annual = (await yf.fundamentalsTimeSeries(sym, { period1: '2019-01-01', type: 'annual', module: 'all' }, { validateResult: false }))
       .map(r => Object.assign({}, r, { iso: isoOf(r.date) })).sort((a, b) => (a.iso < b.iso ? 1 : -1));
     await sleep(300);
     const trailing = (await yf.fundamentalsTimeSeries(sym, { period1: '2023-01-01', type: 'trailing', module: 'all' }, { validateResult: false }))
       .map(r => Object.assign({}, r, { iso: isoOf(r.date) })).sort((a, b) => (a.iso < b.iso ? 1 : -1));
-    await sleep(300);
-    const qs = await yf.quoteSummary(sym, { modules: ['assetProfile', 'price', 'financialData'] }, { validateResult: false });
     await sleep(300);
     if (!annual.length) return { Ticker: ticker, Status: idTag === 'LSE' ? 'No UK financial data on Yahoo Finance' : 'No SEC or Yahoo financial data' };
     row['SEC name'] = (qs.price && qs.price.longName) || '';
