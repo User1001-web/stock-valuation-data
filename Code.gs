@@ -1272,7 +1272,7 @@ var CALC_COLS = [
   ['5-yr earnings', '#,##0.00', 'm:5-yr earnings'], ['Fwd EPS x P/E', '#,##0.00', 'm:Fwd EPS x P/E'],
   ['Graham', '#,##0.00', 'm:Graham'], ['Lynch', '#,##0.00', 'm:Lynch'], ['Dividend discount', '#,##0.00', 'm:Dividend discount'],
   ['Justified P/B', '#,##0.00', 'm:Justified P/B'],
-  ['5-yr target price', '#,##0.00', 'target5'], ['Dividend yield', '0.0%', 'divYield'],
+  ['5-yr price (earnings model)', '#,##0.00', 'target5'], ['Dividend yield', '0.0%', 'divYield'],
   ['Revenue growth 1-yr', '0.0%;[Red]-0.0%', 'revYoY'], ['Revenue growth 3-yr CAGR', '0.0%;[Red]-0.0%', 'revCagr3'],
   ['Gross margin', '0.0%;[Red]-0.0%', 'grossMargin'], ['Operating margin', '0.0%;[Red]-0.0%', 'opMargin'],
   ['FCF margin', '0.0%;[Red]-0.0%', 'fcfMargin'], ['ROIC', '0.0%;[Red]-0.0%', 'roic'],
@@ -1301,8 +1301,8 @@ function calcFormula_(key, r) {
     case 'upside': return '=IF(OR(' + G + '="",' + P + '="",' + P + '=0),"",' + G + '/' + P + '-1)';
     case 'pfv': return '=IF(OR(' + G + '="",' + P + '=""),"",' + P + '/' + G + ')';
     case 'expret':
-      var T = c('5-yr target price'), Y = c('Dividend yield');
-      return '=IF(OR(' + T + '="",' + P + '="",N(' + P + ')<=0,N(' + T + ')<=0),"",(' + T + '/' + P + ')^(1/5)-1+N(' + Y + '))';
+      // Annual return if the price moves to fair value over 5 years while the business earns the required return.
+      return '=IF(OR(' + G + '="",' + P + '="",N(' + P + ')<=0,N(' + G + ')<=0),"",(' + G + '/' + P + ')^(1/5)*(1+REQ_RETURN)-1)';
     case 'status':
       var M = c('Exp. 5-yr return (a year)');
       return '=IF(OR(' + G + '="",' + P + '=""),"No valuation",IF(OR(' + P + '>' + H + ',AND(' + M + '<>"",' + M + '<STRETCH_RETURN)),"Stretched",IF(' + P + '>' + G + ',"Above fair value",IF(' + P + '>=' + J + ',"Fair","Cheap"))))';
@@ -1498,6 +1498,7 @@ function ensureSettings_() {
     added++;
   });
   nameSetting_('Stretched if 5-yr expected return below', 'STRETCH_RETURN');
+  nameSetting_('Required return (5-year models)', 'REQ_RETURN');
 }
 
 /** Holdings: valuation columns to the right of the existing ones (from column N). */
