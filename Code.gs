@@ -1048,10 +1048,20 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   if (ovM !== null && ovM > 1.5) ovM = ovM / 100;
   // Long-run margins: average of the latest 12 months and the last 3 fiscal years
   // (averaging tempers peak-cycle margins).
-  var mF = ovM !== null ? ovM : mean_([fcfMarginNow, fcfMarginAvg]);
+  // FY margin lists for median-based targets (robust to one-off years)
+  var fyMargins = function (num) {
+    var a = [];
+    for (var i = 0; i <= 3; i++) { var x = num(i), rv = fy('Revenue', i); if (x !== null && rv) a.push(x / rv); }
+    return a;
+  };
+  var netFY = fyMargins(function (i) { return fy('NetIncome', i); });
+  var fcfFY = fyMargins(function (i) { var o = fy('OCF', i), c = fy('Capex', i) || 0; return o === null ? null : o - c; });
+  var medNet = netFY.length >= 2 ? median_([netMarginNow].concat(netFY).filter(function (x) { return x !== null; })) : null;
+  var medFcf = fcfFY.length >= 2 ? median_([fcfMarginNow].concat(fcfFY).filter(function (x) { return x !== null; })) : null;
+  var mF = ovM !== null ? ovM : (medFcf !== null ? medFcf : mean_([fcfMarginNow, fcfMarginAvg]));
   if (ovM === null && (mF === null || mF <= 0) && netMarginNow > 0) mF = mean_([netMarginNow, netMarginAvg > 0 ? netMarginAvg : null]);
   if (mF === null || mF <= 0) { mF = S.defFcfMargin; if (ovM === null && type !== 'Financial') out.notes.push('Default FCF margin used'); }
-  var mN = ovM !== null ? ovM : mean_([netMarginNow, netMarginAvg]);
+  var mN = ovM !== null ? ovM : (medNet !== null ? medNet : mean_([netMarginNow, netMarginAvg]));
   if (mN === null || mN <= 0) { mN = S.defNetMargin; if (ovM === null && type !== 'Financial') out.notes.push('Default net margin used'); }
   mF = Math.min(mF, 0.6); mN = Math.min(mN, 0.6);
 
@@ -1068,6 +1078,16 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     lastYear !== null && netMarginNow > 0 && netMarginNow > 2 * Math.max(lastYear, 0.02);
   out.cyclicalPeak = peak;
   var fcfBase = fcf, epsBase = eps;
+  // One-off charges: TTM net margin below half its typical (median) level while operating cash flow is
+  // positive. Earnings-based models then use typical-margin EPS instead of the depressed figure.
+  var depressed = !peak && ovM === null && medNet !== null && medNet > 0.03 && netMarginNow !== null &&
+    netMarginNow < 0.5 * medNet && ocf !== null && ocf > 0;
+  out.depressedEarnings = depressed;
+  if (depressed) {
+    epsBase = rev * medNet / shares;
+    out.notes.push('Earnings look depressed by one-off charges (TTM net margin ' + Math.round(netMarginNow * 100) +
+      '% vs typical ' + Math.round(medNet * 100) + '%); earnings models use the typical margin');
+  }
   if (peak) {
     var cycNet = mean_([netMarginNow].concat(prevNet)), cycFcf = mean_([fcfMarginNow, fcfMarginAvg]);
     mN = Math.max(cycNet, 0.01); mF = Math.max(cycFcf || cycNet, 0.01);
@@ -1173,8 +1193,16 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   // PEG inputs. Forward where analysts cover the stock: next-year consensus EPS and its growth into the
   // following year (both on analysts' adjusted basis). Otherwise trailing EPS with the starting growth rate.
   var estEps1 = n_(raw['Est EPS FY1']);
-  if (estEps1 !== null && estEps1 > 0 && estEps2 !== null && estEps2 > 0) {
+  // Next year is "abnormal" when its EPS is far below (one-off charges) or far above (one-off gains) the
+  // last reported annual EPS AND the year after reverts. Fast genuine growth is not abnormal.
+  var epsFY0 = n_(raw['EPS FY0']);
+  var abnormal = estEps1 !== null && estEps2 !== null && estEps2 > 0 && epsFY0 !== null && epsFY0 > 0 &&
+    ((estEps1 < 0.6 * epsFY0 && estEps2 / Math.max(estEps1, 0.01) > 1.5) || (estEps1 > 1.6 * epsFY0 && estEps2 / estEps1 < 0.67));
+  if (estEps1 !== null && estEps1 > 0 && estEps2 !== null && estEps2 > 0 && !abnormal) {
     out.pegEps = estEps1 * fx; out.epsGrowth = estEps2 / estEps1 - 1; out.epsGrowthBasis = 'Forward: consensus EPS next year to year after';
+  } else if (abnormal) {
+    out.pegEps = estEps2 * fx; out.epsGrowth = g0;
+    out.epsGrowthBasis = 'Next year looks abnormal (EPS ' + (estEps1 * fx).toFixed(2) + ' then ' + (estEps2 * fx).toFixed(2) + '): year-after EPS and start growth used';
   } else {
     out.pegEps = eps; out.epsGrowth = g0; out.epsGrowthBasis = 'Trailing EPS, start growth rate';
   }
