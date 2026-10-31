@@ -92,7 +92,7 @@ var TAGS = {
     DebtExtras: ['ShortTermBorrowings', 'CommercialPaper']
   },
   'ifrs-full': {
-    Revenue: ['Revenue', 'RevenueFromContractsWithCustomers'],
+    Revenue: ['Revenue', 'RevenueFromContractsWithCustomers', 'RevenueFromSaleOfGoods'],
     CostOfRevenue: ['CostOfSales'],
     GrossProfit: ['GrossProfit'],
     OperatingIncome: ['ProfitLossFromOperatingActivities'],
@@ -276,7 +276,9 @@ var MARKET_HEADERS = ['Ticker', 'Google symbol', 'Name', 'Price', 'Currency', 'M
 function marketFormulas_(r) {
   var s = '$B' + r;
   return [
-    '=IF(IFERROR(VLOOKUP($A' + r + ',Tickers!$A:$B,2,FALSE),"")="",$A' + r + ',VLOOKUP($A' + r + ',Tickers!$A:$B,2,FALSE))',
+    '=IF(IFERROR(VLOOKUP($A' + r + ',Tickers!$A:$B,2,FALSE),"")<>"",VLOOKUP($A' + r + ',Tickers!$A:$B,2,FALSE),' +
+      'IFERROR(SWITCH(UPPER(VLOOKUP($A' + r + ',Tickers!$A:$C,3,FALSE)),"UK","LON:","ETF","LON:","DE","ETR:","FR","EPA:","NL","AMS:",' +
+      '"CH","SWX:","IT","BIT:","ES","BME:","SE","STO:","DK","CPH:","NO","OSL:","FI","HEL:","BE","EBR:","IE","ISE:",""),"")&$A' + r + ')',
     '=IFERROR(GOOGLEFINANCE(' + s + ',"name"),"")',
     '=IFERROR(GOOGLEFINANCE(' + s + ',"price"),"")',
     '=IFERROR(GOOGLEFINANCE(' + s + ',"currency"),"")',

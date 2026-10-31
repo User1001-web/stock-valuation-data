@@ -108,6 +108,7 @@ async function main() {
     let row;
     try {
       if (t.market === 'UK') row = await ukRow(t.ticker);
+      else if (EXCH[t.market]) row = await yahooRow(t.ticker, t.ticker + EXCH[t.market], 'YAHOO');
       else if (t.market === 'ETF') row = { Ticker: t.ticker, Status: 'Skipped: ETF (not valued)' };
       else {
         const cik = ciks[t.ticker] || ciks[t.ticker.replace(/\./g, '-')];
@@ -129,6 +130,24 @@ async function main() {
     } catch (err) {
       if (err.blocked) throw err;
       row = { Ticker: t.ticker, Status: 'Error: ' + err.message };
+    }
+    if (row.CIK && /^\d+$/.test(String(row.CIK)) && /^Partial/.test(row.Status || '')) {
+      const key = ['Revenue TTM', 'NetIncome TTM', 'OCF TTM'];
+      if (key.some(k => row[k] === '' || row[k] === undefined)) {
+        const y = await yahooRow(t.ticker, t.ticker.replace(/\./g, '-'), 'YAHOO');
+        const filled = [];
+        ['Revenue', 'NetIncome', 'OCF', 'Capex', 'GrossProfit', 'OperatingIncome'].forEach(fld => {
+          [' TTM', ' TTM 1y ago', ' FY0', ' FY-1', ' FY-2', ' FY-3'].forEach(sfx => {
+            const k = fld + sfx;
+            if ((row[k] === '' || row[k] === undefined) && y[k] !== '' && y[k] !== undefined) { row[k] = y[k]; if (sfx === ' TTM') filled.push(fld); }
+          });
+        });
+        if (filled.length) {
+          const missing = ['Revenue TTM', 'NetIncome TTM', 'OCF TTM', 'Diluted shares latest', 'Cash', 'Equity'].filter(k => row[k] === '' || row[k] === undefined);
+          row.Status = missing.length ? 'Partial: missing ' + missing.join(', ') : 'OK';
+          row.Notes = (row.Notes ? row.Notes + '; ' : '') + filled.join(', ') + ' TTM from Yahoo (missing in SEC filings)';
+        }
+      }
     }
     const staleDays = row['Latest period end'] ? (Date.now() - Date.parse(row['Latest period end'])) / 864e5 : 0;
     if (t.market === 'US' && (/^(No SEC filer|SEC has no)/.test(row.Status || '') || staleDays > 456)) {
@@ -162,6 +181,9 @@ async function main() {
   const ok = rows.filter(r => r.Status === 'OK').length;
   console.log(`\nWrote ${rows.length} rows (${ok} OK) to raw_data.csv`);
 }
+
+// Yahoo symbol suffix per exchange code typed in the Tickers tab (column C).
+const EXCH = { DE: '.DE', FR: '.PA', NL: '.AS', CH: '.SW', IT: '.MI', ES: '.MC', SE: '.ST', DK: '.CO', NO: '.OL', FI: '.HE', BE: '.BR', IE: '.IR' };
 
 // UK listings: annual statements and trailing-12-month figures from Yahoo Finance, mapped to
 // the same Raw Data columns as SEC companies. Balance sheet from the latest annual report.
@@ -261,7 +283,7 @@ async function addYahoo(rows, tickers) {
   for (const r of rows) {
     const m = market[r.Ticker] || 'US';
     if (m === 'ETF') continue;
-    const sym = m === 'UK' ? r.Ticker.replace(/\.$/, '') + '.L' : r.Ticker.replace(/\./g, '-');
+    const sym = m === 'UK' ? r.Ticker.replace(/\.$/, '') + '.L' : EXCH[m] ? r.Ticker + EXCH[m] : r.Ticker.replace(/\./g, '-');
     try {
       const q = await yf.quoteSummary(sym, { modules: ['financialData', 'earningsTrend', 'assetProfile', 'calendarEvents', 'earningsHistory'] }, { validateResult: false });
       // Earnings calendar, last surprise and estimate revisions (next fiscal year EPS)
