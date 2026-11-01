@@ -169,7 +169,7 @@ function onEdit(e) {
     if (name === SV.NAME) {
       var a1 = e.range.getA1Notation();
       if (a1 === SV.TICKER) renderStockView_();
-      else if (a1 === SV.NOTE_CELL || a1 === 'I76:M86') saveNote_(String(e.range.getSheet().getRange(SV.TICKER).getValue()).trim().toUpperCase(), e.range.getValue());
+      else if (a1 === SV.NOTE_CELL || a1 === SV.NOTE_RANGE) saveNote_(String(e.range.getSheet().getRange(SV.TICKER).getValue()).trim().toUpperCase(), e.range.getValue());
     }
   } catch (err) { /* never block an edit */ }
 }
@@ -1599,7 +1599,9 @@ function writeColourRules_() {
 /*  STOCK VIEW — one-stock dashboard driven by the ticker in C2             */
 /* ======================================================================== */
 
-var SV = { NAME: 'Stock view', NOTES: 'Stock notes', TICKER: 'C2', NOTE_CELL: 'I76', HELP_COL: 27 };   // helper data from column AA
+// Layout for a wide (27-inch) screen: three charts per row, about 780 x 330 px each.
+var SV = { NAME: 'Stock view', NOTES: 'Stock notes', TICKER: 'C2', NOTE_CELL: 'R68', NOTE_RANGE: 'R68:X80',
+  GRID_ROW: 49, GRID_COL: 18, HELP_COL: 40, CW: 780, CH: 330 };   // helper data from column AN
 
 /** Formula that looks up a column (by header) for the selected ticker on another tab. */
 function svLook_(sheet, header) {
@@ -1614,11 +1616,11 @@ function buildStockView_() {
   sh.getCharts().forEach(function (c) { sh.removeChart(c); });
   var keep = sh.getRange(SV.TICKER).getValue();
   sh.clear();
-  if (sh.getMaxColumns() < 60) sh.insertColumnsAfter(sh.getMaxColumns(), 60 - sh.getMaxColumns());
+  if (sh.getMaxColumns() < 70) sh.insertColumnsAfter(sh.getMaxColumns(), 70 - sh.getMaxColumns());
   if (sh.getMaxRows() < 420) sh.insertRowsAfter(sh.getMaxRows(), 420 - sh.getMaxRows());
   sh.setHiddenGridlines(true);
   sh.setColumnWidth(1, 16);
-  for (var c = 2; c <= 13; c++) sh.setColumnWidth(c, 96);
+  for (var c = 2; c <= 25; c++) sh.setColumnWidth(c, 100);
   ss.setNamedRange('SV_TICKER', sh.getRange(SV.TICKER));
 
   // Header and selector
@@ -1627,12 +1629,12 @@ function buildStockView_() {
   var rule = SpreadsheetApp.newDataValidation().requireValueInRange(calc.getRange('A2:A2000'), true).setAllowInvalid(false).build();
   sh.getRange(SV.TICKER).setDataValidation(rule).setFontWeight('bold').setFontSize(12).setBackground('#FFF4CC')
     .setValue(keep || (calc.getLastRow() > 1 ? calc.getRange('A2').getValue() : ''));
-  sh.getRange('D2:H2').merge().getCell(1, 1).setFormula('=' + svLook_(SHEET2.CALC, 'Name')).setFontSize(16).setFontWeight('bold');
-  sh.getRange('D3:H3').merge().getCell(1, 1).setFormula('=TEXTJOIN("  ·  ",TRUE,' + svLook_(SHEET2.CALC, 'Sector') + ',' + svLook_(SHEET2.CALC, 'Industry') + ',' +
+  sh.getRange('D2:K2').merge().getCell(1, 1).setFormula('=' + svLook_(SHEET2.CALC, 'Name')).setFontSize(16).setFontWeight('bold');
+  sh.getRange('D3:K3').merge().getCell(1, 1).setFormula('=TEXTJOIN("  ·  ",TRUE,' + svLook_(SHEET2.CALC, 'Sector') + ',' + svLook_(SHEET2.CALC, 'Industry') + ',' +
     svLook_(SHEET2.CALC, 'Type') + ',' + svLook_(SHEET2.CALC, 'List') + ',IF(' + svLook_(SHEET2.CALC, 'Currency') + '="","","Prices in "&' + svLook_(SHEET2.CALC, 'Currency') + '))').setFontColor('#5F5E5A');
-  sh.getRange('J2').setFormula('=' + svLook_(SHEET2.CALC, 'Price')).setFontSize(16).setFontWeight('bold').setNumberFormat('#,##0.00');
-  sh.getRange('K2:L2').merge().getCell(1, 1).setFormula('=' + svLook_(SHEET2.CALC, 'Status')).setFontWeight('bold').setHorizontalAlignment('center');
-  sh.getRange('J3:L3').merge().getCell(1, 1).setFormula('="Data as of "&' + svLook_(SHEET2.CALC, 'Data as of')).setFontColor('#888780').setFontSize(9);
+  sh.getRange('M2').setFormula('=' + svLook_(SHEET2.CALC, 'Price')).setFontSize(16).setFontWeight('bold').setNumberFormat('#,##0.00');
+  sh.getRange('N2:O2').merge().getCell(1, 1).setFormula('=' + svLook_(SHEET2.CALC, 'Status')).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('M3:O3').merge().getCell(1, 1).setFormula('="Data as of "&' + svLook_(SHEET2.CALC, 'Data as of')).setFontColor('#888780').setFontSize(9);
 
   // Metric cards
   var cards = [['Fair value', 'Fair value', '#,##0.00'], ['Upside', 'Upside', '+0%;[Red]-0%'],
@@ -1640,33 +1642,35 @@ function buildStockView_() {
     ['Direction', 'Direction', '@'], ['Implied growth', 'Implied growth (reverse DCF)', '0.0%'],
     ['Expected growth', 'Start growth', '0.0%'], ['Analyst target', 'Analyst target', '#,##0.00']];
   cards.forEach(function (k, i) {
-    var col = 3 + i;
+    var col = 3 + 2 * i;
+    sh.getRange(5, col, 1, 2).merge();
+    sh.getRange(6, col, 1, 2).merge();
     sh.getRange(5, col).setValue(k[0]).setFontColor('#5F5E5A').setFontSize(9).setBackground('#F1EFE8').setHorizontalAlignment('center');
-    sh.getRange(6, col).setFormula('=' + svLook_(SHEET2.CALC, k[1])).setNumberFormat(k[2]).setFontSize(14).setFontWeight('bold')
+    sh.getRange(6, col).setFormula('=' + svLook_(SHEET2.CALC, k[1])).setNumberFormat(k[2]).setFontSize(16).setFontWeight('bold')
       .setBackground('#F1EFE8').setHorizontalAlignment('center');
   });
-  sh.getRange('C7:J7').merge().getCell(1, 1).setFormula('=' + svLook_(SHEET2.CALC, 'Notes')).setFontColor('#888780').setFontSize(9).setWrap(true);
+  sh.getRange('C7:R7').merge().getCell(1, 1).setFormula('=' + svLook_(SHEET2.CALC, 'Notes')).setFontColor('#888780').setFontSize(9).setWrap(true);
   sh.setRowHeight(7, 30);
 
   // Section headings
   var head = function (a1, text) { sh.getRange(a1).setValue(text).setFontWeight('bold').setFontColor('#444441'); };
-  head('B9', '1 · Where the price sits'); head('I9', 'Your position');
-  head('B23', '2 · What each model says'); head('H23', '3 · Revenue and free cash flow (millions, reporting currency)');
-  head('B39', '4 · Price over 1 year'); head('H39', '5 · Earnings per share: actual and forecast');
-  head('B55', '6 · Margins'); head('H55', '7 · Next-year EPS estimate: how it has moved');
-  head('B71', 'Signals'); head('B74', 'Sensitivity: fair value at different growth and discount rates');
-  head('I74', 'Your notes (saved per stock)');
+  head('B9', '1 · Where the price sits'); head('J9', '2 · What each model says'); head('R9', 'Your position');
+  head('B28', '3 · Revenue and free cash flow (millions, reporting currency)'); head('J28', '4 · Earnings per share: actual and forecast');
+  head('R28', '5 · Price over 1 year');
+  head('B47', '6 · Margins'); head('J47', '7 · Next-year EPS estimate: how it has moved');
+  head('R47', 'Sensitivity: fair value at different growth and discount rates');
+  head('B66', 'Signals'); head('R66', 'Your notes (saved per stock)');
 
   // Your position (from Holdings)
   var pos = [['Shares', 'Shares', '#,##0.####'], ['Avg cost (£)', 'Avg cost (£)', '£#,##0.00'], ['Cost (£)', 'Cost (£)', '£#,##0'],
     ['Value (£)', 'Value (£)', '£#,##0'], ['Gain (£)', 'Gain (£)', '£#,##0;[Red]-£#,##0'], ['Gain %', 'Gain %', '0.0%;[Red]-0.0%'],
     ['Weight in portfolio', 'Weight %', '0.0%']];
   pos.forEach(function (p, i) {
-    sh.getRange(10 + i, 9, 1, 2).merge().getCell(1, 1).setValue(p[0]).setFontColor('#5F5E5A');
-    sh.getRange(10 + i, 11, 1, 2).merge().getCell(1, 1).setFormula('=IF(' + svLook_(SHEET.HOLDINGS, 'Ticker') + '="","",' + svLook_(SHEET.HOLDINGS, p[1]) + ')')
+    sh.getRange(10 + i, 18, 1, 2).merge().getCell(1, 1).setValue(p[0]).setFontColor('#5F5E5A');
+    sh.getRange(10 + i, 20, 1, 2).merge().getCell(1, 1).setFormula('=IF(' + svLook_(SHEET.HOLDINGS, 'Ticker') + '="","",' + svLook_(SHEET.HOLDINGS, p[1]) + ')')
       .setNumberFormat(p[2]).setHorizontalAlignment('right');
   });
-  sh.getRange('I17:L17').merge().getCell(1, 1).setFormula('=IF(' + svLook_(SHEET.HOLDINGS, 'Ticker') + '="","Not held (on your watchlist)","")').setFontColor('#888780');
+  sh.getRange('R17:U17').merge().getCell(1, 1).setFormula('=IF(' + svLook_(SHEET.HOLDINGS, 'Ticker') + '="","Not held (on your watchlist)","")').setFontColor('#888780');
 
   // ---- Helper tables (columns AA onwards, hidden) ----
   var H = SV.HELP_COL, put = function (r, c, v) { var cell = sh.getRange(r, H + c); if (String(v).charAt(0) === '=') cell.setFormula(v); else cell.setValue(v); };
@@ -1735,41 +1739,41 @@ function buildStockView_() {
   var hr = function (r1, c1, rows, cols) { return sh.getRange(r1, H + c1, rows, cols); };
   var add = function (builder, row, col, w, h) { sh.insertChart(builder.setPosition(row, col, 0, 0).setOption('width', w).setOption('height', h).build()); };
   add(sh.newChart().setChartType(Charts.ChartType.BAR).addRange(hr(1, 0, 7, 3)).setNumHeaders(1).setOption('isStacked', true)
-    .setOption('legend', { position: 'bottom' }).setOption('colors', ['#5DCAA5', '#185FA5']).setOption('hAxis', { minValue: 0 }), 10, 2, 600, 220);
+    .setOption('legend', { position: 'bottom' }).setOption('colors', ['#5DCAA5', '#185FA5']).setOption('hAxis', { minValue: 0 }), 10, 2, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.COMBO).addRange(hr(9, 0, 9, 3)).setNumHeaders(1)
     .setOption('seriesType', 'bars').setOption('series', { 1: { type: 'line', lineDashStyle: [4, 4] } })
-    .setOption('colors', ['#5DCAA5', '#185FA5']).setOption('legend', { position: 'bottom' }), 24, 2, 560, 300);
+    .setOption('colors', ['#5DCAA5', '#185FA5']).setOption('legend', { position: 'bottom' }), 10, 10, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.COLUMN).addRange(hr(19, 0, 8, 3)).setNumHeaders(1)
-    .setOption('colors', ['#85B7EB', '#1D9E75']).setOption('legend', { position: 'bottom' }), 24, 8, 560, 300);
+    .setOption('colors', ['#85B7EB', '#1D9E75']).setOption('legend', { position: 'bottom' }), 29, 2, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.LINE).addRange(sh.getRange(1, H + 10, 400, 4)).setNumHeaders(1)
     .setOption('colors', ['#378ADD', '#888780', '#0F6E56']).setOption('legend', { position: 'bottom' })
-    .setOption('series', { 1: { lineDashStyle: [3, 3] }, 2: { lineDashStyle: [8, 4] } }), 40, 2, 560, 300);
+    .setOption('series', { 1: { lineDashStyle: [3, 3] }, 2: { lineDashStyle: [8, 4] } }), 29, 18, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.COLUMN).addRange(hr(28, 0, 9, 3)).setNumHeaders(1).setOption('isStacked', true)
-    .setOption('colors', ['#378ADD', '#AFA9EC']).setOption('legend', { position: 'bottom' }), 40, 8, 560, 300);
+    .setOption('colors', ['#378ADD', '#AFA9EC']).setOption('legend', { position: 'bottom' }), 29, 10, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.LINE).addRange(hr(38, 0, 8, 4)).setNumHeaders(1)
     .setOption('colors', ['#1D9E75', '#378ADD', '#7F77DD']).setOption('legend', { position: 'bottom' })
-    .setOption('vAxis', { format: 'percent' }).setOption('pointSize', 4), 56, 2, 560, 280);
+    .setOption('vAxis', { format: 'percent' }).setOption('pointSize', 4), 48, 2, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.COLUMN).addRange(hr(47, 0, 4, 2)).setNumHeaders(1)
-    .setOption('colors', ['#7F77DD']).setOption('legend', { position: 'none' }), 56, 8, 560, 280);
+    .setOption('colors', ['#7F77DD']).setOption('legend', { position: 'none' }), 48, 10, SV.CW, SV.CH);
 
   // Signals row (8 cells from the Calc "Signals" text) and earnings line
-  sh.getRange('C71').setFormula('=IFERROR(SPLIT(' + svLook_(SHEET2.CALC, 'Signals') + ',"  ",FALSE),"")');
-  sh.getRange('C71:J71').setHorizontalAlignment('center').setFontSize(10);
-  var sig = sh.getRange('C71:J71');
+  sh.getRange('B67').setFormula('=IFERROR(SPLIT(' + svLook_(SHEET2.CALC, 'Signals') + ',"  ",FALSE),"")');
+  sh.getRange('B67:I67').setHorizontalAlignment('center').setFontSize(11);
+  var sig = sh.getRange('B67:I67');
   sh.setConditionalFormatRules([
     SpreadsheetApp.newConditionalFormatRule().whenTextContains('↑').setBackground('#EAF3DE').setFontColor('#27500A').setRanges([sig]).build(),
     SpreadsheetApp.newConditionalFormatRule().whenTextContains('↓').setBackground('#FCEBEB').setFontColor('#791F1F').setRanges([sig]).build(),
-    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Cheap').setBackground('#B7E1CD').setRanges([sh.getRange('K2')]).build(),
-    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Fair').setBackground('#E8EAED').setRanges([sh.getRange('K2')]).build(),
-    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Above fair value').setBackground('#FCE8B2').setRanges([sh.getRange('K2')]).build(),
-    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Stretched').setBackground('#F4C7C3').setRanges([sh.getRange('K2')]).build()
+    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Cheap').setBackground('#B7E1CD').setRanges([sh.getRange('N2')]).build(),
+    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Fair').setBackground('#E8EAED').setRanges([sh.getRange('N2')]).build(),
+    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Above fair value').setBackground('#FCE8B2').setRanges([sh.getRange('N2')]).build(),
+    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Stretched').setBackground('#F4C7C3').setRanges([sh.getRange('N2')]).build()
   ]);
-  sh.getRange('C72:J72').merge().getCell(1, 1).setFormula('="Next earnings: "&' + svLook_(SHEET2.CALC, 'Next earnings') +
+  sh.getRange('B68:P68').merge().getCell(1, 1).setFormula('="Next earnings: "&' + svLook_(SHEET2.CALC, 'Next earnings') +
     '&"     Last EPS surprise: "&IFERROR(TEXT(' + svLook_(SHEET2.CALC, 'Last EPS surprise') + ',"+0.0%;-0.0%"),"n/a")' +
     '&"     Revisions (30 days): "&' + svLook_(SHEET2.CALC, 'Analyst revisions 30d')).setFontColor('#5F5E5A');
 
   // Notes box
-  sh.getRange('I76:M86').merge().setBackground('#FFF4CC').setVerticalAlignment('top').setWrap(true)
+  sh.getRange(SV.NOTE_RANGE).merge().setBackground('#FFF4CC').setVerticalAlignment('top').setWrap(true)
     .setBorder(true, true, true, true, false, false, '#D3D1C7', SpreadsheetApp.BorderStyle.SOLID);
   sh.setFrozenRows(3);
   renderStockView_();
@@ -1804,23 +1808,24 @@ function renderStockView_() {
   var t = String(sh.getRange(SV.TICKER).getValue()).trim().toUpperCase();
   sh.getRange(SV.NOTE_CELL).setValue(t ? getNote_(t) : '');
   var grid = t ? sensitivityFor_(t) : null;
-  var area = sh.getRange('B75:G81');
+  var G0 = SV.GRID_ROW, C0 = SV.GRID_COL;
+  var area = sh.getRange(G0, C0, 7, 6);
   area.clearContent().setBackground(null).setFontWeight('normal');
-  if (!grid) { sh.getRange('B75').setValue('No valuation for this stock.'); return; }
+  if (!grid) { sh.getRange(G0, C0).setValue('No valuation for this stock.'); return; }
   var out = [['Start growth ↓  Discount rate →'].concat(grid.rVals.map(function (r) { return r; }))];
   grid.gVals.forEach(function (g, i) { out.push([g].concat(grid.rows[i])); });
-  sh.getRange(75, 2, out.length, out[0].length).setValues(out);
-  sh.getRange(75, 3, 1, grid.rVals.length).setNumberFormat('0.0%').setFontWeight('bold').setBackground('#F1EFE8');
-  sh.getRange(76, 2, grid.gVals.length, 1).setNumberFormat('0.0%').setFontWeight('bold').setBackground('#F1EFE8');
-  sh.getRange(76, 3, grid.gVals.length, grid.rVals.length).setNumberFormat('#,##0.00');
-  sh.getRange(76 + grid.baseRow, 3 + grid.baseCol).setBackground('#CECBF6').setFontWeight('bold');
-  var price = grid.price, cells = sh.getRange(76, 3, grid.gVals.length, grid.rVals.length);
+  sh.getRange(G0, C0, out.length, out[0].length).setValues(out);
+  sh.getRange(G0, C0 + 1, 1, grid.rVals.length).setNumberFormat('0.0%').setFontWeight('bold').setBackground('#F1EFE8');
+  sh.getRange(G0 + 1, C0, grid.gVals.length, 1).setNumberFormat('0.0%').setFontWeight('bold').setBackground('#F1EFE8');
+  sh.getRange(G0 + 1, C0 + 1, grid.gVals.length, grid.rVals.length).setNumberFormat('#,##0.00');
+  sh.getRange(G0 + 1 + grid.baseRow, C0 + 1 + grid.baseCol).setBackground('#CECBF6').setFontWeight('bold');
+  var price = grid.price, cells = sh.getRange(G0 + 1, C0 + 1, grid.gVals.length, grid.rVals.length);
   if (price) {
     var bg = grid.rows.map(function (row) { return row.map(function (v) { return v === '' ? null : v >= price ? '#EAF3DE' : '#FCEBEB'; }); });
     bg[grid.baseRow][grid.baseCol] = '#CECBF6';
     cells.setBackgrounds(bg);
   }
-  sh.getRange('B81:G81').merge().getCell(1, 1).setValue('Shaded green where fair value is above today\'s price, red where below. Purple = current settings.')
+  sh.getRange(G0 + 6, C0, 1, 6).merge().getCell(1, 1).setValue('Shaded green where fair value is above today\'s price, red where below. Purple = current settings.')
     .setFontColor('#888780').setFontSize(9);
 }
 
