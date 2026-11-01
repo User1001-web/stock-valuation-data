@@ -1657,7 +1657,7 @@ function buildStockView_() {
   head('B9', '1 · Where the price sits'); head('J9', '2 · What each model says'); head('R9', 'Your position');
   head('B28', '3 · Revenue and free cash flow (millions, reporting currency)'); head('J28', '4 · Earnings per share: actual and forecast');
   head('R28', '5 · Price over 1 year');
-  head('B47', '6 · Margins'); head('J47', '7 · Next-year EPS estimate: how it has moved');
+  head('B47', '6 · Margins (% of revenue)'); head('J47', '7 · Next-year EPS estimate: how it has moved');
   head('R47', 'Sensitivity: fair value at different growth and discount rates');
   head('B66', 'Signals'); head('R66', 'Your notes (saved per stock)');
 
@@ -1708,31 +1708,35 @@ function buildStockView_() {
   put(36, 2, '=IFERROR(1/(1/' + svLook_(SHEET.RAW, 'Est EPS FY2') + '),)');
   // T6 margins: year | gross | operating | net
   put(38, 0, 'Year'); put(38, 1, 'Gross margin'); put(38, 2, 'Operating margin'); put(38, 3, 'Net margin');
-  var mg = function (num, sfx) { return '=IFERROR(' + svLook_(SHEET.RAW, num + sfx) + '/' + svLook_(SHEET.RAW, 'Revenue' + sfx) + ',)'; };
+  // Margins as % of revenue, clipped to -100%..+100% so one extreme year doesn't flatten the chart
+  var mg = function (num, sfx) { return '=IFERROR(MAX(-1,MIN(1,' + svLook_(SHEET.RAW, num + sfx) + '/' + svLook_(SHEET.RAW, 'Revenue' + sfx) + ')),)'; };
   for (var k = 5; k >= 0; k--) {
     var r3 = 39 + (5 - k), s3 = k === 0 ? ' FY0' : ' FY-' + k;
     sh.getRange(r3, H).setFormula('=' + colL_(H) + (20 + 5 - k));
     put(r3, 1, mg('GrossProfit', s3)); put(r3, 2, mg('OperatingIncome', s3)); put(r3, 3, mg('NetIncome', s3));
   }
+  sh.getRange(39, H + 1, 7, 3).setNumberFormat('0.0%');
   put(45, 0, 'Last 12m'); put(45, 1, mg('GrossProfit', ' TTM')); put(45, 2, mg('OperatingIncome', ' TTM')); put(45, 3, mg('NetIncome', ' TTM'));
   // T7 estimate trend
   put(47, 0, ''); put(47, 1, 'Next-year EPS estimate');
   put(48, 0, '90 days ago'); put(48, 1, '=IFERROR(1/(1/' + svLook_(SHEET.RAW, 'EPS est 90d ago') + '),)');
   put(49, 0, '30 days ago'); put(49, 1, '=IFERROR(1/(1/' + svLook_(SHEET.RAW, 'EPS est 30d ago') + '),)');
   put(50, 0, 'Now'); put(50, 1, '=IFERROR(1/(1/' + svLook_(SHEET.RAW, 'EPS est now') + '),)');
-  // T4 price history (raw pull, 200-day average, last-year table for the chart)
+  // T4 price history: one price pull (about 21 months), then a last-12-months table with a
+  // 200-day average (about 290 calendar days) and the fair value line, using plain formulas only.
   var sym = 'IFERROR(VLOOKUP(SV_TICKER,Market!$A:$B,2,FALSE),SV_TICKER)';
-  var P = colL_(H + 6), Q = colL_(H + 7), R = colL_(H + 8), T = colL_(H + 10);
-  sh.getRange(1, H + 6).setFormula('=IFERROR(GOOGLEFINANCE(' + sym + ',"close",TODAY()-600,TODAY()),"")');
-  sh.getRange(1, H + 8).setValue('200-day avg');
-  sh.getRange(2, H + 8).setFormula('=IFERROR(LET(cl,FILTER(' + Q + '2:' + Q + '700,ISNUMBER(' + Q + '2:' + Q + '700)),n,ROWS(cl),' +
-    'MAP(SEQUENCE(n),LAMBDA(i,IF(i<200,"",AVERAGE(CHOOSEROWS(cl,SEQUENCE(200,1,i-199))))))),"")');
+  var P = colL_(H + 6), Q = colL_(H + 7), T = colL_(H + 10), FVC = colL_(H + 14);
+  sh.getRange(1, H + 6).setFormula('=IFERROR(GOOGLEFINANCE(' + sym + ',"close",TODAY()-660,TODAY()),"")');
+  sh.getRange(1, H + 14).setFormula('=N(' + svLook_(SHEET2.CALC, 'Fair value') + ')');
   sh.getRange(1, H + 10, 1, 4).setValues([['Date', 'Price', '200-day average', 'Fair value']]);
-  sh.getRange(2, H + 10).setFormula('=IFERROR(LET(d,FILTER(' + P + '2:' + P + '700,ISNUMBER(' + Q + '2:' + Q + '700)),' +
-    'c,FILTER(' + Q + '2:' + Q + '700,ISNUMBER(' + Q + '2:' + Q + '700)),m,' + R + '2:INDEX(' + R + '2:' + R + '700,ROWS(d)),' +
-    'fv,N(' + svLook_(SHEET2.CALC, 'Fair value') + '),keep,d>=TODAY()-365,' +
-    'FILTER(HSTACK(d,c,m,IF(fv>0,MAP(d,LAMBDA(x,fv)),MAP(d,LAMBDA(x,"")))),keep)),"")');
-  sh.getRange(2, H + 10, 400, 1).setNumberFormat('d mmm yy');
+  sh.getRange(2, H + 10).setFormula('=IFERROR(FILTER(' + P + '2:' + Q + '700,ISNUMBER(' + Q + '2:' + Q + '700),' + P + '2:' + P + '700>=TODAY()-365),"")');
+  var rows = [];
+  for (var pr = 2; pr <= 300; pr++) {
+    rows.push(['=IF(ISNUMBER(' + T + pr + '),AVERAGEIFS($' + Q + '$2:$' + Q + '$700,$' + P + '$2:$' + P + '$700,">"&(' + T + pr + '-290),$' + P + '$2:$' + P + '$700,"<="&' + T + pr + '),"")',
+      '=IF(AND(ISNUMBER(' + T + pr + '),$' + FVC + '$1>0),$' + FVC + '$1,"")']);
+  }
+  sh.getRange(2, H + 12, rows.length, 2).setFormulas(rows);
+  sh.getRange(2, H + 10, 299, 1).setNumberFormat('d mmm yy');
   sh.hideColumns(H, 20);
 
   // ---- Charts ----
@@ -1742,19 +1746,20 @@ function buildStockView_() {
     .setOption('legend', { position: 'bottom' }).setOption('colors', ['#5DCAA5', '#185FA5']).setOption('hAxis', { minValue: 0 }), 10, 2, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.COMBO).addRange(hr(9, 0, 9, 3)).setNumHeaders(1)
     .setOption('seriesType', 'bars').setOption('series', { 1: { type: 'line', lineDashStyle: [4, 4] } })
-    .setOption('colors', ['#5DCAA5', '#185FA5']).setOption('legend', { position: 'bottom' }), 10, 10, SV.CW, SV.CH);
+    .setOption('colors', ['#5DCAA5', '#185FA5']).setOption('legend', { position: 'bottom' }).setOption('vAxis', { title: 'Value per share' }), 10, 10, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.COLUMN).addRange(hr(19, 0, 8, 3)).setNumHeaders(1)
-    .setOption('colors', ['#85B7EB', '#1D9E75']).setOption('legend', { position: 'bottom' }), 29, 2, SV.CW, SV.CH);
-  add(sh.newChart().setChartType(Charts.ChartType.LINE).addRange(sh.getRange(1, H + 10, 400, 4)).setNumHeaders(1)
+    .setOption('colors', ['#85B7EB', '#1D9E75']).setOption('legend', { position: 'bottom' }).setOption('vAxis', { title: 'Millions' }), 29, 2, SV.CW, SV.CH);
+  add(sh.newChart().setChartType(Charts.ChartType.LINE).addRange(sh.getRange(1, H + 10, 300, 4)).setNumHeaders(1)
+    .setOption('vAxis', { title: 'Price' }).setOption('hAxis', { format: 'MMM yy' })
     .setOption('colors', ['#378ADD', '#888780', '#0F6E56']).setOption('legend', { position: 'bottom' })
     .setOption('series', { 1: { lineDashStyle: [3, 3] }, 2: { lineDashStyle: [8, 4] } }), 29, 18, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.COLUMN).addRange(hr(28, 0, 9, 3)).setNumHeaders(1).setOption('isStacked', true)
-    .setOption('colors', ['#378ADD', '#AFA9EC']).setOption('legend', { position: 'bottom' }), 29, 10, SV.CW, SV.CH);
+    .setOption('colors', ['#378ADD', '#AFA9EC']).setOption('legend', { position: 'bottom' }).setOption('vAxis', { title: 'EPS per share' }), 29, 10, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.LINE).addRange(hr(38, 0, 8, 4)).setNumHeaders(1)
     .setOption('colors', ['#1D9E75', '#378ADD', '#7F77DD']).setOption('legend', { position: 'bottom' })
-    .setOption('vAxis', { format: 'percent' }).setOption('pointSize', 4), 48, 2, SV.CW, SV.CH);
+    .setOption('vAxis', { format: 'percent', title: '% of revenue (clipped at ±100%)' }).setOption('pointSize', 4), 48, 2, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.COLUMN).addRange(hr(47, 0, 4, 2)).setNumHeaders(1)
-    .setOption('colors', ['#7F77DD']).setOption('legend', { position: 'none' }), 48, 10, SV.CW, SV.CH);
+    .setOption('colors', ['#7F77DD']).setOption('legend', { position: 'none' }).setOption('vAxis', { title: 'EPS per share' }), 48, 10, SV.CW, SV.CH);
 
   // Signals row (8 cells from the Calc "Signals" text) and earnings line
   sh.getRange('B67').setFormula('=IFERROR(SPLIT(' + svLook_(SHEET2.CALC, 'Signals') + ',"  ",FALSE),"")');
