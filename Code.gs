@@ -154,6 +154,9 @@ function onOpen() {
     .addItem('Recalculate valuations', 'recalcValuations')
     .addItem('Rebuild Market tab', 'rebuildMarket')
     .addItem('Repair formulas (after sorting)', 'repairFormulas')
+    .addSeparator()
+    .addItem('Open selected ticker in Stock view', 'openInStockView')
+    .addItem('Rebuild Stock view tab', 'rebuildStockView')
     .addToUi();
 }
 
@@ -163,8 +166,15 @@ function onEdit(e) {
     var name = e.range.getSheet().getName();
     if ((name === SHEET.TICKERS || name === SHEET.HOLDINGS) && e.range.getColumn() <= 2) { syncMarket_(); recalcValuations(); }
     if (name === SHEET.ASSUME || (name === SHEET.TICKERS && e.range.getColumn() >= 5 && e.range.getColumn() <= 7)) recalcValuations();
+    if (name === SV.NAME) {
+      var a1 = e.range.getA1Notation();
+      if (a1 === SV.TICKER) renderStockView_();
+      else if (a1 === SV.NOTE_CELL || a1 === 'I76:M86') saveNote_(String(e.range.getSheet().getRange(SV.TICKER).getValue()).trim().toUpperCase(), e.range.getValue());
+    }
   } catch (err) { /* never block an edit */ }
 }
+
+function rebuildStockView() { buildStockView_(); SpreadsheetApp.getActive().toast('Stock view rebuilt.', 'Valuation', 5); }
 
 function repairFormulas() { repairFormulas_(); recalcValuations(); SpreadsheetApp.getActive().toast('Formulas repaired.', 'Valuation', 5); }
 
@@ -192,6 +202,7 @@ function setup() {
   writeHoldingsValuation_();
   writeWatchlist_();
   writeColourRules_();
+  buildStockView_();
 
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (t.getHandlerFunction() === 'refreshFundamentals') ScriptApp.deleteTrigger(t);
@@ -372,6 +383,7 @@ function refreshFundamentals() {
     if (result.rows.length) sh.getRange(2, 1, result.rows.length, RAW_COLS.length).setValues(result.rows);
     loadRates_(url);
     recalcValuations();
+    try { renderStockView_(); } catch (err) { /* view not built yet */ }
 
     var prev = PropertiesService.getDocumentProperties().getProperty('LAST_STAMP');
     if (result.stamp !== prev) {
@@ -1074,7 +1086,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var cyclicalSic = (sic >= 1000 && sic <= 1499) || (sic >= 2800 && sic <= 2999) || (sic >= 3300 && sic <= 3399) ||
     (sic >= 3670 && sic <= 3679) || (sic >= 3711 && sic <= 3716) || (sic >= 4400 && sic <= 4499);
   var established = (fy('Revenue', 3) || 0) >= 5e9;
-  var peak = cyclicalSic && established && ovG === null && ovM === null && yoy !== null && yoy > 0.5 && netMarginNow !== null &&
+  var peak = cyclicalSic && established && (ovG === null || ovr.keepPeak) && ovM === null && yoy !== null && yoy > 0.5 && netMarginNow !== null &&
     lastYear !== null && netMarginNow > 0 && netMarginNow > 2 * Math.max(lastYear, 0.02);
   out.cyclicalPeak = peak;
   var fcfBase = fcf, epsBase = eps;
@@ -1092,7 +1104,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     var cycNet = mean_([netMarginNow].concat(prevNet)), cycFcf = mean_([fcfMarginNow, fcfMarginAvg]);
     mN = Math.max(cycNet, 0.01); mF = Math.max(cycFcf || cycNet, 0.01);
     fcfBase = rev * mF; epsBase = rev * mN / shares;
-    if (!consensus) { g0 = gT; path = growthPath_(g0, gT); out.g0 = g0; out.gBasis = 'Cyclical peak: no growth assumed'; }
+    if (!consensus && ovG === null) { g0 = gT; path = growthPath_(g0, gT); out.g0 = g0; out.gBasis = 'Cyclical peak: no growth assumed'; }
     out.notes.push('Possible cyclical peak: average-cycle margins used' + (consensus ? '' : ' and no growth') + ' (override on Tickers to change)');
   }
 
@@ -1581,6 +1593,289 @@ function writeColourRules_() {
   apply(ss.getSheetByName(SHEET.HOLDINGS), holdingsCol_('Status') + '2:' + holdingsCol_('Status') + '500');
   apply(ss.getSheetByName(SHEET2.WATCH), watchCol_('Signal') + '2:' + watchCol_('Signal') + '500');
   apply(ss.getSheetByName(SHEET2.CALC), calcL_('Status') + '2:' + calcL_('Watch signal') + '500');
+}
+
+/* ======================================================================== */
+/*  STOCK VIEW — one-stock dashboard driven by the ticker in C2             */
+/* ======================================================================== */
+
+var SV = { NAME: 'Stock view', NOTES: 'Stock notes', TICKER: 'C2', NOTE_CELL: 'I76', HELP_COL: 27 };   // helper data from column AA
+
+/** Formula that looks up a column (by header) for the selected ticker on another tab. */
+function svLook_(sheet, header) {
+  var q = "'" + sheet + "'";
+  return 'IFERROR(INDEX(' + q + '!$A$1:$ZZ$2000,MATCH(SV_TICKER,' + q + '!$A$1:$A$2000,0),MATCH("' + header + '",' + q + '!$A$1:$ZZ$1,0)),"")';
+}
+
+/** Builds (or rebuilds) the Stock view tab: layout, helper tables and charts. */
+function buildStockView_() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(SV.NAME) || ss.insertSheet(SV.NAME);
+  sh.getCharts().forEach(function (c) { sh.removeChart(c); });
+  var keep = sh.getRange(SV.TICKER).getValue();
+  sh.clear();
+  if (sh.getMaxColumns() < 60) sh.insertColumnsAfter(sh.getMaxColumns(), 60 - sh.getMaxColumns());
+  if (sh.getMaxRows() < 420) sh.insertRowsAfter(sh.getMaxRows(), 420 - sh.getMaxRows());
+  sh.setHiddenGridlines(true);
+  sh.setColumnWidth(1, 16);
+  for (var c = 2; c <= 13; c++) sh.setColumnWidth(c, 96);
+  ss.setNamedRange('SV_TICKER', sh.getRange(SV.TICKER));
+
+  // Header and selector
+  sh.getRange('B2').setValue('Stock').setFontColor('#5F5E5A');
+  var calc = ss.getSheetByName(SHEET2.CALC);
+  var rule = SpreadsheetApp.newDataValidation().requireValueInRange(calc.getRange('A2:A2000'), true).setAllowInvalid(false).build();
+  sh.getRange(SV.TICKER).setDataValidation(rule).setFontWeight('bold').setFontSize(12).setBackground('#FFF4CC')
+    .setValue(keep || (calc.getLastRow() > 1 ? calc.getRange('A2').getValue() : ''));
+  sh.getRange('D2:H2').merge().getCell(1, 1).setFormula('=' + svLook_(SHEET2.CALC, 'Name')).setFontSize(16).setFontWeight('bold');
+  sh.getRange('D3:H3').merge().getCell(1, 1).setFormula('=TEXTJOIN("  ·  ",TRUE,' + svLook_(SHEET2.CALC, 'Sector') + ',' + svLook_(SHEET2.CALC, 'Industry') + ',' +
+    svLook_(SHEET2.CALC, 'Type') + ',' + svLook_(SHEET2.CALC, 'List') + ',IF(' + svLook_(SHEET2.CALC, 'Currency') + '="","","Prices in "&' + svLook_(SHEET2.CALC, 'Currency') + '))').setFontColor('#5F5E5A');
+  sh.getRange('J2').setFormula('=' + svLook_(SHEET2.CALC, 'Price')).setFontSize(16).setFontWeight('bold').setNumberFormat('#,##0.00');
+  sh.getRange('K2:L2').merge().getCell(1, 1).setFormula('=' + svLook_(SHEET2.CALC, 'Status')).setFontWeight('bold').setHorizontalAlignment('center');
+  sh.getRange('J3:L3').merge().getCell(1, 1).setFormula('="Data as of "&' + svLook_(SHEET2.CALC, 'Data as of')).setFontColor('#888780').setFontSize(9);
+
+  // Metric cards
+  var cards = [['Fair value', 'Fair value', '#,##0.00'], ['Upside', 'Upside', '+0%;[Red]-0%'],
+    ['Exp. return a year', 'Exp. 5-yr return (a year)', '0.0%;[Red]-0.0%'], ['PEG', 'PEG', '0.00'],
+    ['Direction', 'Direction', '@'], ['Implied growth', 'Implied growth (reverse DCF)', '0.0%'],
+    ['Expected growth', 'Start growth', '0.0%'], ['Analyst target', 'Analyst target', '#,##0.00']];
+  cards.forEach(function (k, i) {
+    var col = 3 + i;
+    sh.getRange(5, col).setValue(k[0]).setFontColor('#5F5E5A').setFontSize(9).setBackground('#F1EFE8').setHorizontalAlignment('center');
+    sh.getRange(6, col).setFormula('=' + svLook_(SHEET2.CALC, k[1])).setNumberFormat(k[2]).setFontSize(14).setFontWeight('bold')
+      .setBackground('#F1EFE8').setHorizontalAlignment('center');
+  });
+  sh.getRange('C7:J7').merge().getCell(1, 1).setFormula('=' + svLook_(SHEET2.CALC, 'Notes')).setFontColor('#888780').setFontSize(9).setWrap(true);
+  sh.setRowHeight(7, 30);
+
+  // Section headings
+  var head = function (a1, text) { sh.getRange(a1).setValue(text).setFontWeight('bold').setFontColor('#444441'); };
+  head('B9', '1 · Where the price sits'); head('I9', 'Your position');
+  head('B23', '2 · What each model says'); head('H23', '3 · Revenue and free cash flow (millions, reporting currency)');
+  head('B39', '4 · Price over 1 year'); head('H39', '5 · Earnings per share: actual and forecast');
+  head('B55', '6 · Margins'); head('H55', '7 · Next-year EPS estimate: how it has moved');
+  head('B71', 'Signals'); head('B74', 'Sensitivity: fair value at different growth and discount rates');
+  head('I74', 'Your notes (saved per stock)');
+
+  // Your position (from Holdings)
+  var pos = [['Shares', 'Shares', '#,##0.####'], ['Avg cost (£)', 'Avg cost (£)', '£#,##0.00'], ['Cost (£)', 'Cost (£)', '£#,##0'],
+    ['Value (£)', 'Value (£)', '£#,##0'], ['Gain (£)', 'Gain (£)', '£#,##0;[Red]-£#,##0'], ['Gain %', 'Gain %', '0.0%;[Red]-0.0%'],
+    ['Weight in portfolio', 'Weight %', '0.0%']];
+  pos.forEach(function (p, i) {
+    sh.getRange(10 + i, 9, 1, 2).merge().getCell(1, 1).setValue(p[0]).setFontColor('#5F5E5A');
+    sh.getRange(10 + i, 11, 1, 2).merge().getCell(1, 1).setFormula('=IF(' + svLook_(SHEET.HOLDINGS, 'Ticker') + '="","",' + svLook_(SHEET.HOLDINGS, p[1]) + ')')
+      .setNumberFormat(p[2]).setHorizontalAlignment('right');
+  });
+  sh.getRange('I17:L17').merge().getCell(1, 1).setFormula('=IF(' + svLook_(SHEET.HOLDINGS, 'Ticker') + '="","Not held (on your watchlist)","")').setFontColor('#888780');
+
+  // ---- Helper tables (columns AA onwards, hidden) ----
+  var H = SV.HELP_COL, put = function (r, c, v) { var cell = sh.getRange(r, H + c); if (String(v).charAt(0) === '=') cell.setFormula(v); else cell.setValue(v); };
+  // T1 range bar: label | value | price
+  var t1 = [['Low', 'Low'], ['Buy below', 'Buy below'], ['Fair value', 'Fair value'], ['High', 'High'], ['Analyst target', 'Analyst target']];
+  put(1, 0, ''); put(1, 1, 'Model range'); put(1, 2, 'Price now');
+  t1.forEach(function (t, i) { put(2 + i, 0, t[0]); put(2 + i, 1, '=N(' + svLook_(SHEET2.CALC, t[1]) + ')'); put(2 + i, 2, ''); });
+  put(7, 0, 'Price'); put(7, 1, ''); put(7, 2, '=N(' + svLook_(SHEET2.CALC, 'Price') + ')');
+  // T2 models: name | value | price
+  put(9, 0, 'Model'); put(9, 1, 'Value'); put(9, 2, 'Price');
+  MODEL_NAMES.forEach(function (m, i) {
+    put(10 + i, 0, m); put(10 + i, 1, '=IFERROR(1/(1/' + svLook_(SHEET2.CALC, m) + '),)'); put(10 + i, 2, '=N(' + svLook_(SHEET2.CALC, 'Price') + ')');
+  });
+  // T3 revenue / FCF: year | revenue | FCF (millions)
+  put(19, 0, 'Year'); put(19, 1, 'Revenue'); put(19, 2, 'Free cash flow');
+  var fyEnd = svLook_(SHEET.RAW, 'Latest FY end');
+  for (var i = 5; i >= 0; i--) {
+    var r = 20 + (5 - i), sfx = i === 0 ? '0' : '-' + i;
+    put(r, 0, '=IFERROR("FY"&(YEAR(' + fyEnd + ')-' + i + '),"FY-' + i + '")');
+    put(r, 1, '=IFERROR(1/(1/(' + svLook_(SHEET.RAW, 'Revenue FY' + sfx) + '/1e6)),)');
+    put(r, 2, '=IFERROR((' + svLook_(SHEET.RAW, 'OCF FY' + sfx) + '-N(' + svLook_(SHEET.RAW, 'Capex FY' + sfx) + '))/1e6,)');
+  }
+  put(26, 0, 'Last 12m'); put(26, 1, '=IFERROR(1/(1/(' + svLook_(SHEET.RAW, 'Revenue TTM') + '/1e6)),)');
+  put(26, 2, '=IFERROR((' + svLook_(SHEET.RAW, 'OCF TTM') + '-N(' + svLook_(SHEET.RAW, 'Capex TTM') + '))/1e6,)');
+  // T5 EPS: year | actual | forecast
+  put(28, 0, 'Year'); put(28, 1, 'Actual EPS'); put(28, 2, 'Analyst forecast');
+  for (var j = 5; j >= 0; j--) {
+    var rr = 29 + (5 - j), s2 = j === 0 ? '0' : '-' + j;
+    put(rr, 0, '=IFERROR("FY"&(YEAR(' + fyEnd + ')-' + j + '),"FY-' + j + '")');
+    put(rr, 1, '=IFERROR(1/(1/' + svLook_(SHEET.RAW, 'EPS FY' + s2) + '),)'); put(rr, 2, '');
+  }
+  put(35, 0, '=IFERROR("FY"&(YEAR(' + fyEnd + ')+1)&"e","Next yr")'); put(35, 1, '');
+  put(35, 2, '=IFERROR(1/(1/' + svLook_(SHEET.RAW, 'Est EPS FY1') + '),)');
+  put(36, 0, '=IFERROR("FY"&(YEAR(' + fyEnd + ')+2)&"e","Yr after")'); put(36, 1, '');
+  put(36, 2, '=IFERROR(1/(1/' + svLook_(SHEET.RAW, 'Est EPS FY2') + '),)');
+  // T6 margins: year | gross | operating | net
+  put(38, 0, 'Year'); put(38, 1, 'Gross margin'); put(38, 2, 'Operating margin'); put(38, 3, 'Net margin');
+  var mg = function (num, sfx) { return '=IFERROR(' + svLook_(SHEET.RAW, num + sfx) + '/' + svLook_(SHEET.RAW, 'Revenue' + sfx) + ',)'; };
+  for (var k = 5; k >= 0; k--) {
+    var r3 = 39 + (5 - k), s3 = k === 0 ? ' FY0' : ' FY-' + k;
+    sh.getRange(r3, H).setFormula('=' + colL_(H) + (20 + 5 - k));
+    put(r3, 1, mg('GrossProfit', s3)); put(r3, 2, mg('OperatingIncome', s3)); put(r3, 3, mg('NetIncome', s3));
+  }
+  put(45, 0, 'Last 12m'); put(45, 1, mg('GrossProfit', ' TTM')); put(45, 2, mg('OperatingIncome', ' TTM')); put(45, 3, mg('NetIncome', ' TTM'));
+  // T7 estimate trend
+  put(47, 0, ''); put(47, 1, 'Next-year EPS estimate');
+  put(48, 0, '90 days ago'); put(48, 1, '=IFERROR(1/(1/' + svLook_(SHEET.RAW, 'EPS est 90d ago') + '),)');
+  put(49, 0, '30 days ago'); put(49, 1, '=IFERROR(1/(1/' + svLook_(SHEET.RAW, 'EPS est 30d ago') + '),)');
+  put(50, 0, 'Now'); put(50, 1, '=IFERROR(1/(1/' + svLook_(SHEET.RAW, 'EPS est now') + '),)');
+  // T4 price history (raw pull, 200-day average, last-year table for the chart)
+  var sym = 'IFERROR(VLOOKUP(SV_TICKER,Market!$A:$B,2,FALSE),SV_TICKER)';
+  var P = colL_(H + 6), Q = colL_(H + 7), R = colL_(H + 8), T = colL_(H + 10);
+  sh.getRange(1, H + 6).setFormula('=IFERROR(GOOGLEFINANCE(' + sym + ',"close",TODAY()-600,TODAY()),"")');
+  sh.getRange(1, H + 8).setValue('200-day avg');
+  sh.getRange(2, H + 8).setFormula('=IFERROR(LET(cl,FILTER(' + Q + '2:' + Q + '700,ISNUMBER(' + Q + '2:' + Q + '700)),n,ROWS(cl),' +
+    'MAP(SEQUENCE(n),LAMBDA(i,IF(i<200,"",AVERAGE(CHOOSEROWS(cl,SEQUENCE(200,1,i-199))))))),"")');
+  sh.getRange(1, H + 10, 1, 4).setValues([['Date', 'Price', '200-day average', 'Fair value']]);
+  sh.getRange(2, H + 10).setFormula('=IFERROR(LET(d,FILTER(' + P + '2:' + P + '700,ISNUMBER(' + Q + '2:' + Q + '700)),' +
+    'c,FILTER(' + Q + '2:' + Q + '700,ISNUMBER(' + Q + '2:' + Q + '700)),m,' + R + '2:INDEX(' + R + '2:' + R + '700,ROWS(d)),' +
+    'fv,N(' + svLook_(SHEET2.CALC, 'Fair value') + '),keep,d>=TODAY()-365,' +
+    'FILTER(HSTACK(d,c,m,IF(fv>0,MAP(d,LAMBDA(x,fv)),MAP(d,LAMBDA(x,"")))),keep)),"")');
+  sh.getRange(2, H + 10, 400, 1).setNumberFormat('d mmm yy');
+  sh.hideColumns(H, 20);
+
+  // ---- Charts ----
+  var hr = function (r1, c1, rows, cols) { return sh.getRange(r1, H + c1, rows, cols); };
+  var add = function (builder, row, col, w, h) { sh.insertChart(builder.setPosition(row, col, 0, 0).setOption('width', w).setOption('height', h).build()); };
+  add(sh.newChart().setChartType(Charts.ChartType.BAR).addRange(hr(1, 0, 7, 3)).setNumHeaders(1).setOption('isStacked', true)
+    .setOption('legend', { position: 'bottom' }).setOption('colors', ['#5DCAA5', '#185FA5']).setOption('hAxis', { minValue: 0 }), 10, 2, 600, 220);
+  add(sh.newChart().setChartType(Charts.ChartType.COMBO).addRange(hr(9, 0, 9, 3)).setNumHeaders(1)
+    .setOption('seriesType', 'bars').setOption('series', { 1: { type: 'line', lineDashStyle: [4, 4] } })
+    .setOption('colors', ['#5DCAA5', '#185FA5']).setOption('legend', { position: 'bottom' }), 24, 2, 560, 300);
+  add(sh.newChart().setChartType(Charts.ChartType.COLUMN).addRange(hr(19, 0, 8, 3)).setNumHeaders(1)
+    .setOption('colors', ['#85B7EB', '#1D9E75']).setOption('legend', { position: 'bottom' }), 24, 8, 560, 300);
+  add(sh.newChart().setChartType(Charts.ChartType.LINE).addRange(sh.getRange(1, H + 10, 400, 4)).setNumHeaders(1)
+    .setOption('colors', ['#378ADD', '#888780', '#0F6E56']).setOption('legend', { position: 'bottom' })
+    .setOption('series', { 1: { lineDashStyle: [3, 3] }, 2: { lineDashStyle: [8, 4] } }), 40, 2, 560, 300);
+  add(sh.newChart().setChartType(Charts.ChartType.COLUMN).addRange(hr(28, 0, 9, 3)).setNumHeaders(1).setOption('isStacked', true)
+    .setOption('colors', ['#378ADD', '#AFA9EC']).setOption('legend', { position: 'bottom' }), 40, 8, 560, 300);
+  add(sh.newChart().setChartType(Charts.ChartType.LINE).addRange(hr(38, 0, 8, 4)).setNumHeaders(1)
+    .setOption('colors', ['#1D9E75', '#378ADD', '#7F77DD']).setOption('legend', { position: 'bottom' })
+    .setOption('vAxis', { format: 'percent' }).setOption('pointSize', 4), 56, 2, 560, 280);
+  add(sh.newChart().setChartType(Charts.ChartType.COLUMN).addRange(hr(47, 0, 4, 2)).setNumHeaders(1)
+    .setOption('colors', ['#7F77DD']).setOption('legend', { position: 'none' }), 56, 8, 560, 280);
+
+  // Signals row (8 cells from the Calc "Signals" text) and earnings line
+  sh.getRange('C71').setFormula('=IFERROR(SPLIT(' + svLook_(SHEET2.CALC, 'Signals') + ',"  ",FALSE),"")');
+  sh.getRange('C71:J71').setHorizontalAlignment('center').setFontSize(10);
+  var sig = sh.getRange('C71:J71');
+  sh.setConditionalFormatRules([
+    SpreadsheetApp.newConditionalFormatRule().whenTextContains('↑').setBackground('#EAF3DE').setFontColor('#27500A').setRanges([sig]).build(),
+    SpreadsheetApp.newConditionalFormatRule().whenTextContains('↓').setBackground('#FCEBEB').setFontColor('#791F1F').setRanges([sig]).build(),
+    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Cheap').setBackground('#B7E1CD').setRanges([sh.getRange('K2')]).build(),
+    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Fair').setBackground('#E8EAED').setRanges([sh.getRange('K2')]).build(),
+    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Above fair value').setBackground('#FCE8B2').setRanges([sh.getRange('K2')]).build(),
+    SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Stretched').setBackground('#F4C7C3').setRanges([sh.getRange('K2')]).build()
+  ]);
+  sh.getRange('C72:J72').merge().getCell(1, 1).setFormula('="Next earnings: "&' + svLook_(SHEET2.CALC, 'Next earnings') +
+    '&"     Last EPS surprise: "&IFERROR(TEXT(' + svLook_(SHEET2.CALC, 'Last EPS surprise') + ',"+0.0%;-0.0%"),"n/a")' +
+    '&"     Revisions (30 days): "&' + svLook_(SHEET2.CALC, 'Analyst revisions 30d')).setFontColor('#5F5E5A');
+
+  // Notes box
+  sh.getRange('I76:M86').merge().setBackground('#FFF4CC').setVerticalAlignment('top').setWrap(true)
+    .setBorder(true, true, true, true, false, false, '#D3D1C7', SpreadsheetApp.BorderStyle.SOLID);
+  sh.setFrozenRows(3);
+  renderStockView_();
+}
+
+/* ---- Selection, notes, sensitivity ---- */
+
+function notesSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(SV.NOTES);
+  if (!sh) { sh = ss.insertSheet(SV.NOTES); sh.getRange(1, 1, 1, 3).setValues([['Ticker', 'Note', 'Updated']]); sh.hideSheet(); }
+  return sh;
+}
+function getNote_(t) {
+  var sh = notesSheet_(); if (sh.getLastRow() < 2) return '';
+  var v = sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues();
+  for (var i = 0; i < v.length; i++) if (String(v[i][0]).toUpperCase() === t) return v[i][1];
+  return '';
+}
+function saveNote_(t, text) {
+  if (!t) return;
+  var sh = notesSheet_(), last = sh.getLastRow();
+  var v = last > 1 ? sh.getRange(2, 1, last - 1, 1).getValues() : [];
+  for (var i = 0; i < v.length; i++) if (String(v[i][0]).toUpperCase() === t) { sh.getRange(i + 2, 2, 1, 2).setValues([[text, new Date()]]); return; }
+  sh.getRange(last + 1, 1, 1, 3).setValues([[t, text, new Date()]]);
+}
+
+/** Fills the parts of the Stock view the script owns: notes and the sensitivity grid. */
+function renderStockView_() {
+  var ss = SpreadsheetApp.getActive(), sh = ss.getSheetByName(SV.NAME);
+  if (!sh) return;
+  var t = String(sh.getRange(SV.TICKER).getValue()).trim().toUpperCase();
+  sh.getRange(SV.NOTE_CELL).setValue(t ? getNote_(t) : '');
+  var grid = t ? sensitivityFor_(t) : null;
+  var area = sh.getRange('B75:G81');
+  area.clearContent().setBackground(null).setFontWeight('normal');
+  if (!grid) { sh.getRange('B75').setValue('No valuation for this stock.'); return; }
+  var out = [['Start growth ↓  Discount rate →'].concat(grid.rVals.map(function (r) { return r; }))];
+  grid.gVals.forEach(function (g, i) { out.push([g].concat(grid.rows[i])); });
+  sh.getRange(75, 2, out.length, out[0].length).setValues(out);
+  sh.getRange(75, 3, 1, grid.rVals.length).setNumberFormat('0.0%').setFontWeight('bold').setBackground('#F1EFE8');
+  sh.getRange(76, 2, grid.gVals.length, 1).setNumberFormat('0.0%').setFontWeight('bold').setBackground('#F1EFE8');
+  sh.getRange(76, 3, grid.gVals.length, grid.rVals.length).setNumberFormat('#,##0.00');
+  sh.getRange(76 + grid.baseRow, 3 + grid.baseCol).setBackground('#CECBF6').setFontWeight('bold');
+  var price = grid.price, cells = sh.getRange(76, 3, grid.gVals.length, grid.rVals.length);
+  if (price) {
+    var bg = grid.rows.map(function (row) { return row.map(function (v) { return v === '' ? null : v >= price ? '#EAF3DE' : '#FCEBEB'; }); });
+    bg[grid.baseRow][grid.baseCol] = '#CECBF6';
+    cells.setBackgrounds(bg);
+  }
+  sh.getRange('B81:G81').merge().getCell(1, 1).setValue('Shaded green where fair value is above today\'s price, red where below. Purple = current settings.')
+    .setFontColor('#888780').setFontSize(9);
+}
+
+/** Blended fair value across start-growth and discount-rate scenarios for one ticker. */
+function sensitivityFor_(t) {
+  var ss = SpreadsheetApp.getActive();
+  var today = dnum_(Utilities.formatDate(new Date(), 'UTC', 'yyyy-MM-dd'));
+  var S = settingsFromMap_(assumptionsMap_());
+  var raw = sheetObjects_(SHEET.RAW, 'Ticker')[t];
+  if (!raw) return null;
+  var mk = ss.getSheetByName(SHEET.MARKET), m = {};
+  if (mk.getLastRow() > 1) mk.getRange(2, 1, mk.getLastRow() - 1, MARKET_HEADERS.length).getValues().forEach(function (r) {
+    if (String(r[0]).toUpperCase() === t) {
+      var cur = String(r[4] || '').trim();
+      m = { price: typeof r[3] === 'number' ? r[3] : null, currency: /^[A-Z]{3}$/.test(cur) ? cur : '',
+        shares: typeof r[6] === 'number' ? r[6] : null, beta: typeof r[7] === 'number' ? r[7] : null };
+    }
+  });
+  var calc = sheetObjects_(SHEET2.CALC, 'Ticker')[t] || {};
+  var tk = ss.getSheetByName(SHEET.TICKERS), ovr = {};
+  if (tk.getLastRow() > 1) tk.getRange(2, 1, tk.getLastRow() - 1, 7).getValues().forEach(function (r) {
+    if (String(r[0]).trim().toUpperCase() === t) ovr = { type: r[4], growth: r[5], margin: r[6] };
+  });
+  // Exchange rate as used on Calc (reported currency -> listing currency)
+  var fx = 1;
+  if (raw.Currency && m.currency && raw.Currency !== m.currency) {
+    var pairs = fxRates_(m.currency === 'GBX' ? (raw.Currency === 'GBP' ? [] : [raw.Currency + 'GBP']) : [raw.Currency + m.currency]);
+    fx = m.currency === 'GBX' ? (raw.Currency === 'GBP' ? 100 : (pairs[raw.Currency + 'GBP'] || 0) * 100) : (pairs[raw.Currency + m.currency] || 0);
+    if (!fx) return null;
+  }
+  var base = valueCompany(raw, m, fx, ovr, S, null, today);
+  if (!base.fv || base.g0 === undefined || base.r === undefined) return null;
+  var gVals = [-0.10, -0.05, 0, 0.05, 0.10].map(function (d) { return clamp_(base.g0 + d, S.gFloor, Math.max(S.gCap, base.g0 + d)); });
+  var rVals = [-0.02, -0.01, 0, 0.01, 0.02].map(function (d) { return Math.max(base.r + d, S.gTerm + 0.02); });
+  var rows = gVals.map(function (g) {
+    return rVals.map(function (r) {
+      var S2 = {}; for (var k in S) S2[k] = S[k];
+      S2.rMin = r; S2.rMax = r; S2.gCap = Math.max(S.gCap, g); S2.req = Math.max(S.req + (r - base.r), S.gTerm + 0.02);
+      var v = valueCompany(raw, m, fx, { type: ovr.type, growth: g, margin: ovr.margin, keepPeak: true }, S2, null, today);
+      return v.fv ? v.fv : '';
+    });
+  });
+  return { gVals: gVals, rVals: rVals, rows: rows, baseRow: 2, baseCol: 2, price: m.price || n_(calc.Price) };
+}
+
+/** Menu: show the ticker in the selected row (any tab) on the Stock view. */
+function openInStockView() {
+  var ss = SpreadsheetApp.getActive(), cell = ss.getActiveRange(), src = cell.getSheet();
+  var t = String(src.getRange(cell.getRow(), 1).getValue()).trim().toUpperCase();
+  var sh = ss.getSheetByName(SV.NAME);
+  if (!sh) { buildStockView_(); sh = ss.getSheetByName(SV.NAME); }
+  if (!t || cell.getRow() === 1) { ss.toast('Select a cell in a ticker row first.', 'Valuation', 5); return; }
+  sh.getRange(SV.TICKER).setValue(t);
+  renderStockView_();
+  ss.setActiveSheet(sh);
 }
 
 /* Lets the parsing functions be tested outside Google (ignored by Apps Script). */
