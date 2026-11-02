@@ -149,6 +149,20 @@ async function main() {
         }
       }
     }
+    // SEC figures over 150 days old (annual-only foreign filers, combined filings missing from the feed):
+    // take the latest 12 months from Yahoo when it is newer. History and balance sheet stay from the SEC.
+    if (row.CIK && /^\d+$/.test(String(row.CIK)) && row['Latest period end'] && (Date.now() - Date.parse(row['Latest period end'])) / 864e5 > 150) {
+      const y = await yahooRow(t.ticker, t.ticker.replace(/\./g, '-'), 'YAHOO');
+      if (y['Latest period end'] && Date.parse(y['Latest period end']) > Date.parse(row['Latest period end']) + 60 * 864e5 &&
+          (!y.Currency || !row.Currency || y.Currency === row.Currency)) {
+        ['Revenue', 'GrossProfit', 'OperatingIncome', 'NetIncome', 'PretaxIncome', 'IncomeTax', 'InterestExpense', 'OCF', 'Capex', 'SBC', 'DA', 'DividendsPaid', 'Buybacks']
+          .forEach(fld => { [' TTM', ' TTM 1y ago'].forEach(sfx => { if (y[fld + sfx] !== '' && y[fld + sfx] !== undefined) row[fld + sfx] = y[fld + sfx]; }); });
+        ['EPS TTM', 'EPS TTM 1y ago', 'Diluted shares latest'].forEach(k => { if (y[k] !== '' && y[k] !== undefined) row[k] = y[k]; });
+        row.Notes = (row.Notes ? row.Notes.replace(/; ?Latest financials are over 200 days old/, '') + '; ' : '') +
+          'Latest 12 months from Yahoo (to ' + y['Latest period end'] + '), newer than SEC data (' + row['Latest period end'] + ')';
+        row['Latest period end'] = y['Latest period end'];
+      }
+    }
     const staleDays = row['Latest period end'] ? (Date.now() - Date.parse(row['Latest period end'])) / 864e5 : 0;
     if (t.market === 'US' && (/^(No SEC filer|SEC has no)/.test(row.Status || '') || staleDays > 456)) {
       const y = await yahooRow(t.ticker, t.ticker.replace(/\./g, '-'), 'YAHOO');

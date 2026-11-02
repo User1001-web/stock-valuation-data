@@ -522,6 +522,7 @@ function fixScaleSlips_(F) {
     s.forEach(function (f) {
       var k = f.start + '|' + f.end, e = eps[k], n = sh[k];
       if (!e || !n || !e.val || !n.val || !f.val) return;
+      if (Math.abs(e.val) < 0.05) return;            // EPS rounded to a cent: the identity is too noisy to judge scale
       var r = f.val / (e.val * n.val);
       if (r <= 0) return;
       var lr = Math.log(r) / Math.LN10 / 3, step = Math.round(lr);
@@ -983,6 +984,10 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     shares = gShares; out.notes.push('SEC share count looked inconsistent; Google Finance count used');
   }
   if (!shares) { out.type = 'No share count'; return out; }
+  var cover = n_(raw['Shares outstanding']);
+  if (cover && cover / shares >= 1.5 && cover / shares <= 3 && !(gShares && gShares / shares < 1.3)) {
+    shares = cover; out.notes.push('Share count raised to the latest cover-page figure (new shares issued since the last quarter)');
+  }
   var shares1 = n_(raw['Diluted shares 1y ago']);
 
   var rev = F('Revenue TTM'), rev1 = F('Revenue TTM 1y ago');
@@ -1021,6 +1026,10 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var ovG = n_(ovr.growth);
   var estRev2 = F('Est revenue FY2'), estEps2 = n_(raw['Est EPS FY2']);
   var consensus = estRev2 !== null && estRev2 > 0 && r0 !== null && r0 > 0;
+  if (consensus && r0 >= 25e6 && (estRev2 / r0 < 0.4 || estRev2 / r0 > 4)) {
+    consensus = false;
+    out.notes.push('Analyst revenue forecast uses a different revenue definition (' + (estRev2 / r0).toFixed(2) + 'x reported); history used for growth');
+  }
   var fy0End = raw['Latest FY end'], fy2End = raw['Est FY2 end'] || '';
   var estYears = fy0End && fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - dnum_(String(fy0End).slice(0, 10))) / 365.25, 1, 3.5) : 2;
   var yearsAhead = fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - today) / 365.25, 0.5, 3) : 2;
