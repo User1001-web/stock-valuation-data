@@ -1483,6 +1483,8 @@ function recalcValuations() {
   sh.setFrozenColumns(1);
   if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, CALC_COLS.length).clearContent();
   if (!out.length) return;
+  // Alphabetical, so the Stock view dropdown (which lists Calc tickers) is easy to search.
+  out.sort(function (a, b) { return a.ticker < b.ticker ? -1 : a.ticker > b.ticker ? 1 : 0; });
   var rows = out.map(function (v, i) {
     var r = i + 2;
     return CALC_COLS.map(function (c) {
