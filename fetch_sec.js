@@ -157,7 +157,7 @@ async function main() {
           (!y.Currency || !row.Currency || y.Currency === row.Currency)) {
         ['Revenue', 'GrossProfit', 'OperatingIncome', 'NetIncome', 'PretaxIncome', 'IncomeTax', 'InterestExpense', 'OCF', 'Capex', 'SBC', 'DA', 'DividendsPaid', 'Buybacks']
           .forEach(fld => { [' TTM', ' TTM 1y ago'].forEach(sfx => { if (y[fld + sfx] !== '' && y[fld + sfx] !== undefined) row[fld + sfx] = y[fld + sfx]; }); });
-        ['EPS TTM', 'EPS TTM 1y ago', 'Diluted shares latest'].forEach(k => { if (y[k] !== '' && y[k] !== undefined) row[k] = y[k]; });
+        ['EPS TTM', 'EPS TTM 1y ago', 'Diluted shares latest', 'Diluted shares 1y ago'].forEach(k => { if (y[k] !== '' && y[k] !== undefined) row[k] = y[k]; });
         row.Notes = (row.Notes ? row.Notes.replace(/; ?Latest financials are over 200 days old/, '') + '; ' : '') +
           'Latest 12 months from Yahoo (to ' + y['Latest period end'] + '), newer than SEC data (' + row['Latest period end'] + ')';
         row['Latest period end'] = y['Latest period end'];
@@ -301,7 +301,8 @@ async function addYahoo(rows, tickers) {
     if (m === 'ETF') continue;
     const sym = m === 'UK' ? r.Ticker.replace(/\.$/, '') + '.L' : EXCH[m] ? r.Ticker + EXCH[m] : r.Ticker.replace(/\./g, '-');
     try {
-      const q = await yf.quoteSummary(sym, { modules: ['financialData', 'earningsTrend', 'assetProfile', 'calendarEvents', 'earningsHistory'] }, { validateResult: false });
+      const q = await yf.quoteSummary(sym, { modules: ['financialData', 'earningsTrend', 'assetProfile', 'calendarEvents', 'earningsHistory', 'price'] }, { validateResult: false });
+      if (q.price && typeof q.price.marketCap === 'number') r['Yahoo market cap'] = q.price.marketCap;
       // Earnings calendar, last surprise and estimate revisions (next fiscal year EPS)
       const ce = (q.calendarEvents && q.calendarEvents.earnings) || {};
       const nextDates = (ce.earningsDate || []).map(x => new Date(x)).filter(x => !isNaN(x)).sort((a, b) => a - b);

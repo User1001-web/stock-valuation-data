@@ -138,7 +138,7 @@ var RAW_COLS = (function () {
   c.push('Est FY1 end', 'Est revenue FY1', 'Est revenue FY2', 'Est EPS FY1', 'Est EPS FY2', 'Est analysts',
     'Target consensus', 'Target high', 'Target low', 'Est FY2 end', 'Est source', 'Sector', 'Yahoo price', 'Yahoo industry',
     'Next earnings', 'Last EPS surprise', 'Last earnings quarter', 'EPS est now', 'EPS est 30d ago', 'EPS est 90d ago',
-    'Revisions up 30d', 'Revisions down 30d', 'Est EPS growth 5y');
+    'Revisions up 30d', 'Revisions down 30d', 'Est EPS growth 5y', 'Yahoo market cap');
   return c;
 })();
 
@@ -518,6 +518,18 @@ function keyMap_(s) { var m = {}; s.forEach(function (f) { m[f.start + '|' + f.e
 function fixScaleSlips_(F) {
   var eps = keyMap_(F.EPS.merged), sh = keyMap_(F.DilutedShares.merged), rev = keyMap_(F.Revenue.merged);
   var fixed = {}, notes = [];
+  // Share counts 1,000x (or 1,000,000x) away from the company's median share count are filer slips.
+  var shVals = F.DilutedShares.merged.map(function (f) { return f.val; }).filter(function (v) { return v > 0; });
+  if (shVals.length >= 3) {
+    var med = median_(shVals);
+    F.DilutedShares.byTag.forEach(function (s) {
+      s.forEach(function (f) {
+        if (!(f.val > 0)) return;
+        var lr = Math.log(f.val / med) / Math.LN10 / 3, st = Math.round(lr);
+        if (st !== 0 && Math.abs(lr - st) < 0.2) { f.val = f.val / Math.pow(1000, st); fixed[f.start + '|' + f.end] = 1; notes.push('share count ' + f.end); }
+      });
+    });
+  }
   F.NetIncome.byTag.forEach(function (s) {
     s.forEach(function (f) {
       var k = f.start + '|' + f.end, e = eps[k], n = sh[k];
@@ -980,12 +992,19 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var shares = n_(raw['Diluted shares latest']);
   var gShares = n_(mkt.shares);
   if (!shares && gShares) { shares = gShares; out.notes.push('Share count from Google Finance'); }
-  else if (shares && gShares && (gShares / shares > 3 || shares / gShares > 3)) {
-    shares = gShares; out.notes.push('SEC share count looked inconsistent; Google Finance count used');
-  }
+
   if (!shares) { out.type = 'No share count'; return out; }
+  // Share count implied by market value / price matches the security actually quoted (ADR ratios, share classes).
+  var mcap = n_(mkt.mcap) || n_(raw['Yahoo market cap']);
+  var listingGBX = mkt.currency === 'GBX' || raw.CIK === 'LSE';
+  var implied = !listingGBX && mcap && price ? mcap / price : null;
+  var usedImplied = false;
+  if (implied && (shares / implied > 1.5 || shares / implied < 0.67)) {
+    out.notes.push('Share count set from market value / price (' + (shares / implied).toFixed(2) + 'x the filed count: ADR ratio, share classes or new issuance)');
+    shares = implied; usedImplied = true;
+  }
   var cover = n_(raw['Shares outstanding']);
-  if (cover && cover / shares >= 1.5 && cover / shares <= 3 && !(gShares && gShares / shares < 1.3)) {
+  if (!usedImplied && cover && cover / shares >= 1.5 && cover / shares <= 3 && !(gShares && gShares / shares < 1.3)) {
     shares = cover; out.notes.push('Share count raised to the latest cover-page figure (new shares issued since the last quarter)');
   }
   var shares1 = n_(raw['Diluted shares 1y ago']);
@@ -1352,7 +1371,8 @@ function recalcValuations() {
     var cur = String(r[4] || '').trim();
     market[String(r[0]).toUpperCase()] = { name: typeof r[2] === 'string' && r[2].charAt(0) !== '=' ? r[2] : '', price: typeof r[3] === 'number' ? r[3] : null,
       currency: /^[A-Z]{3}$/.test(cur) ? cur : '',
-      shares: typeof r[6] === 'number' ? r[6] : null, beta: typeof r[7] === 'number' ? r[7] : null };
+      shares: typeof r[6] === 'number' ? r[6] : null, beta: typeof r[7] === 'number' ? r[7] : null,
+      mcap: typeof r[5] === 'number' ? r[5] : null };
   });
   var tk = ss.getSheetByName(SHEET.TICKERS);
   var tv = tk.getLastRow() > 1 ? tk.getRange(2, 1, tk.getLastRow() - 1, 7).getValues() : [];
@@ -1855,7 +1875,8 @@ function sensitivityFor_(t) {
     if (String(r[0]).toUpperCase() === t) {
       var cur = String(r[4] || '').trim();
       m = { price: typeof r[3] === 'number' ? r[3] : null, currency: /^[A-Z]{3}$/.test(cur) ? cur : '',
-        shares: typeof r[6] === 'number' ? r[6] : null, beta: typeof r[7] === 'number' ? r[7] : null };
+        shares: typeof r[6] === 'number' ? r[6] : null, beta: typeof r[7] === 'number' ? r[7] : null,
+        mcap: typeof r[5] === 'number' ? r[5] : null };
     }
   });
   var calc = sheetObjects_(SHEET2.CALC, 'Ticker')[t] || {};
