@@ -301,8 +301,15 @@ async function addYahoo(rows, tickers) {
     if (m === 'ETF') continue;
     const sym = m === 'UK' ? r.Ticker.replace(/\.$/, '') + '.L' : EXCH[m] ? r.Ticker + EXCH[m] : r.Ticker.replace(/\./g, '-');
     try {
-      const q = await yf.quoteSummary(sym, { modules: ['financialData', 'earningsTrend', 'assetProfile', 'calendarEvents', 'earningsHistory', 'price'] }, { validateResult: false });
+      const q = await yf.quoteSummary(sym, { modules: ['financialData', 'earningsTrend', 'assetProfile', 'calendarEvents', 'earningsHistory', 'price', 'summaryDetail', 'defaultKeyStatistics'] }, { validateResult: false });
       if (q.price && typeof q.price.marketCap === 'number') r['Yahoo market cap'] = q.price.marketCap;
+      // Price momentum (ratios, so GBX/USD units cancel out)
+      const sd = q.summaryDetail || {}, ks = q.defaultKeyStatistics || {};
+      const px = (q.financialData && q.financialData.currentPrice) || (q.price && q.price.regularMarketPrice);
+      if (typeof ks['52WeekChange'] === 'number') r['12m price change'] = ks['52WeekChange'];
+      if (px > 0 && sd.twoHundredDayAverage > 0) r['Price vs 200d avg'] = px / sd.twoHundredDayAverage - 1;
+      if (px > 0 && sd.fiftyDayAverage > 0) r['Price vs 50d avg'] = px / sd.fiftyDayAverage - 1;
+      if (px > 0 && sd.fiftyTwoWeekHigh > 0) r['Off 52w high'] = px / sd.fiftyTwoWeekHigh - 1;
       // Earnings calendar, last surprise and estimate revisions (next fiscal year EPS)
       const ce = (q.calendarEvents && q.calendarEvents.earnings) || {};
       const nextDates = (ce.earningsDate || []).map(x => new Date(x)).filter(x => !isNaN(x)).sort((a, b) => a - b);

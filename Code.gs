@@ -138,7 +138,8 @@ var RAW_COLS = (function () {
   c.push('Est FY1 end', 'Est revenue FY1', 'Est revenue FY2', 'Est EPS FY1', 'Est EPS FY2', 'Est analysts',
     'Target consensus', 'Target high', 'Target low', 'Est FY2 end', 'Est source', 'Sector', 'Yahoo price', 'Yahoo industry',
     'Next earnings', 'Last EPS surprise', 'Last earnings quarter', 'EPS est now', 'EPS est 30d ago', 'EPS est 90d ago',
-    'Revisions up 30d', 'Revisions down 30d', 'Est EPS growth 5y', 'Yahoo market cap');
+    'Revisions up 30d', 'Revisions down 30d', 'Est EPS growth 5y', 'Yahoo market cap',
+    '12m price change', 'Price vs 200d avg', 'Price vs 50d avg', 'Off 52w high');
   return c;
 })();
 
@@ -201,6 +202,7 @@ function setup() {
   recalcValuations();
   writeHoldingsValuation_();
   writeWatchlist_();
+  writeSetups_();
   writeColourRules_();
   buildStockView_();
 
@@ -252,7 +254,7 @@ function repairFormulas_() {
   writeTickerFormulas_();
   ho.getRange(2, 6, Math.max(ho.getMaxRows() - 1, 1), Math.max(ho.getMaxColumns() - 5, 1)).clearContent();
   writeHoldingsFormulas_();
-  if (ss.getSheetByName(SHEET2.CALC)) { writeHoldingsValuation_(true); writeWatchlist_(true); }
+  if (ss.getSheetByName(SHEET2.CALC)) { writeHoldingsValuation_(true); writeWatchlist_(true); if (ss.getSheetByName(SHEET2.SETUPS)) writeSetups_(true); }
 }
 
 /* Tickers: column D shows whether each ticker is held or watched. */
@@ -978,6 +980,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   out.estChg30 = chg(eNow, e30); out.estChg90 = chg(eNow, e90);
   var up30 = n_(raw['Revisions up 30d']), dn30 = n_(raw['Revisions down 30d']);
   out.revisionsText = up30 !== null || dn30 !== null ? (up30 || 0) + ' up / ' + (dn30 || 0) + ' down' : '';
+  out.mom12 = n_(raw['12m price change']); out.vs200 = n_(raw['Price vs 200d avg']);
   var status = String(raw.Status || '');
   out.dataDate = raw['Latest period end'] || '';
   if (!raw.CIK || /^(Skipped|No SEC|SEC has no|Error|Waiting)/.test(status)) {
@@ -1290,14 +1293,63 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   out.scorePct = avail.length ? out.score / avail.length : null;
   out.scoreChange = past && past.score !== null && past.score !== undefined && past.score !== '' ? out.score - past.score : null;
   out.signalText = keys.map(function (k) { return k + (sig[k] === null ? ' –' : sig[k] ? ' ↑' : ' ↓'); }).join('  ');
+  setupFor_(out, raw, price, eps, type, S);
   return out;
+}
+
+/* Setup: where value, analysts, estimate revisions, quality and price trend agree.
+   Value setup  - at or below fair value, analysts see 15%+ upside, estimates not falling, trend not broken.
+   Compounder   - looks expensive, but the price assumes less growth than the company delivers,
+                  with high returns on capital, rising estimates and a rising price.
+   Value, waiting for trend - cheap, but estimates or the price are still falling.
+   Trend broken - a quality grower that is not cheap, with the price and estimates turning down.
+   Thin targets - big analyst upside resting on few analysts or a very wide range of targets. */
+var SETUP_RANK = { 'Value setup': 1, 'Compounder': 2, 'Value, waiting for trend': 3, 'Trend broken': 4, 'Thin targets': 5 };
+function setupFor_(out, raw, price, eps, type, S) {
+  out.setup = ''; out.setupScore = null; out.setupChecks = ''; out.setupRank = '';
+  if (!price || !out.fv) return;
+  var exp = Math.pow(out.fv / price, 1 / 5) * (1 + S.req) - 1;
+  var tUp = out.analystTarget ? out.analystTarget / price - 1 : null;
+  var hi = n_(raw['Target high']), lo = n_(raw['Target low']);
+  var thin = !out.analysts || out.analysts < 5 || (out.analysts < 10 && hi > 0 && lo > 0 && hi / lo > 3);
+  var up30 = n_(raw['Revisions up 30d']), dn30 = n_(raw['Revisions down 30d']);
+  var e90 = out.estChg90;
+  var estUp = e90 !== null ? e90 > 0.005 : up30 !== null && dn30 !== null && up30 > dn30;
+  var estDown = e90 !== null ? e90 < -0.01 : up30 !== null && dn30 !== null && dn30 > up30;
+  var v2 = out.vs200, m12 = out.mom12;
+  var trendUp = v2 === null ? null : v2 > 0 && (m12 === null || m12 > -0.05);
+  var trendDown = v2 !== null && v2 < -0.05;
+  var profitable = eps > 0 && (type === 'Financial' || (out.opMargin !== null && out.opMargin > 0));
+  var spec = type === 'Pre-profit' || !profitable || out.notes.some(function (x) { return /Caution|Speculative/.test(x); });
+  var growth = Math.max(out.revYoY === null || out.revYoY === undefined ? -1 : out.revYoY, out.epsGrowth === null || out.epsGrowth === undefined ? -1 : out.epsGrowth);
+  var impl = typeof out.implied === 'number' ? out.implied : null;
+  var pricedIn = impl !== null && growth > 0 && impl <= growth;
+  var cheap = exp >= S.req;                          // price at or below fair value
+  var dir = out.scorePct || 0, roic = out.roic;
+  var analystsAgree = tUp !== null && tUp >= 0.15 && !thin;
+
+  var s = '';
+  if (!spec && cheap && analystsAgree && !estDown && dir >= 0.6 && !trendDown) s = 'Value setup';
+  else if (!spec && !cheap && roic !== null && roic >= 0.12 && dir >= 0.75 && growth >= 0.12 && pricedIn && estUp &&
+    trendUp !== false && (tUp === null || tUp > 0)) s = 'Compounder';
+  else if (!spec && cheap && dir >= 0.5 && (estDown || trendDown)) s = 'Value, waiting for trend';
+  else if (!spec && !cheap && roic !== null && roic >= 0.12 && growth >= 0.1 && ((trendDown && estDown) || (v2 !== null && v2 < -0.15))) s = 'Trend broken';
+  else if (tUp !== null && tUp >= 0.3 && thin) s = 'Thin targets';
+  out.setup = s; out.setupRank = s ? SETUP_RANK[s] : '';
+  var tick = function (b) { return b === null ? '–' : b ? '✓' : '✗'; };
+  out.setupScore = [cheap, analystsAgree, estUp, dir >= 0.75, trendUp === true, roic !== null && roic >= 0.15, pricedIn]
+    .filter(function (b) { return b; }).length;
+  out.setupChecks = 'Value ' + tick(cheap) + '  Analysts ' + (tUp === null ? '–' : thin ? '? (thin)' : tick(analystsAgree)) +
+    '  Estimates ' + (estUp ? '↑' : estDown ? '↓' : '–') + '  Quality ' + tick(roic === null ? null : roic >= 0.15 && dir >= 0.6) +
+    '  Trend ' + (trendUp === null ? '–' : trendUp ? '↑' : trendDown ? '↓' : '→') + '  Priced-in growth ' + tick(impl === null ? null : pricedIn) +
+    (spec ? '  (speculative: no setup)' : '');
 }
 
 /* ======================================================================== */
 /*  STAGE 2 — SHEET WIRING: Calc, Watchlist, History, FX, rates             */
 /* ======================================================================== */
 
-var SHEET2 = { CALC: 'Calc', WATCH: 'Watchlist', HIST: 'History', FX: 'FX' };
+var SHEET2 = { CALC: 'Calc', WATCH: 'Watchlist', HIST: 'History', FX: 'FX', SETUPS: 'Setups' };
 
 function colL_(n) { var s = ''; while (n > 0) { var m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = (n - m - 1) / 26; } return s; }
 
@@ -1332,7 +1384,10 @@ var CALC_COLS = [
   ['Model vs analysts', '+0%;[Red]-0%', 'modelVsAnalysts'],
   ['Next earnings', '@', 'nextEarnings'], ['Last EPS surprise', '+0.0%;[Red]-0.0%', 'surprise'],
   ['EPS estimate change 30d', '+0.0%;[Red]-0.0%', 'estChg30'], ['EPS estimate change 90d', '+0.0%;[Red]-0.0%', 'estChg90'],
-  ['Analyst revisions 30d', '@', 'revisionsText'], ['Sort key', '0.000', 'F:sort']
+  ['Analyst revisions 30d', '@', 'revisionsText'],
+  ['Setup', '@', 'setup'], ['Setup strength (of 7)', '0', 'setupScore'], ['Setup checks', '@', 'setupChecks'], ['Setup rank', '0', 'setupRank'],
+  ['12m price change', '+0%;[Red]-0%', 'mom12'], ['Price vs 200-day average', '+0%;[Red]-0%', 'vs200'],
+  ['Sort key', '0.000', 'F:sort']
 ];
 function calcIdx_(header) { for (var i = 0; i < CALC_COLS.length; i++) if (CALC_COLS[i][0] === header) return i + 1; throw new Error(header); }
 function calcL_(header) { return colL_(calcIdx_(header)); }
@@ -1558,7 +1613,8 @@ var HOLDINGS_COLS = [
   ['Expectations gap', 'Expectations gap (implied - expected growth)', '+0.0%;[Red]-0.0%', 90],
   ['Model vs analysts', 'Model vs analysts', '+0%;[Red]-0%', 85],
   ['Next earnings', 'Next earnings', '@', 110], ['Last EPS surprise', 'Last EPS surprise', '+0.0%;[Red]-0.0%', 80],
-  ['EPS est. change 90d', 'EPS estimate change 90d', '+0.0%;[Red]-0.0%', 80], ['Revisions 30d', 'Analyst revisions 30d', '@', 100]
+  ['EPS est. change 90d', 'EPS estimate change 90d', '+0.0%;[Red]-0.0%', 80], ['Revisions 30d', 'Analyst revisions 30d', '@', 100],
+  ['Setup', 'Setup', '@', 150], ['Setup checks', 'Setup checks', '@', 420]
 ];
 var HOLDINGS_FIRST = 14;
 
@@ -1586,13 +1642,14 @@ var WATCH_COLS = [
   ['Price', 'Price', '#,##0.00'], ['Currency', 'Currency', '@'], ['Fair value', 'Fair value', '#,##0.00'],
   ['Buy below', 'Buy below', '#,##0.00'], ['Upside', 'Upside', '0.0%;[Red]-0.0%'],
   ['Exp. return a year (5 yrs)', 'Exp. 5-yr return (a year)', '0.0%;[Red]-0.0%'], ['Direction', 'Direction', '@'],
-  ['Signal', 'Watch signal', '@'], ['Implied growth', 'Implied growth (reverse DCF)', '0.0%'],
+  ['Signal', 'Watch signal', '@'], ['Setup', 'Setup', '@'], ['Implied growth', 'Implied growth (reverse DCF)', '0.0%'],
   ['Cash runway (months)', 'Cash runway (months)', '0'], ['Dilution 1-yr', 'Dilution 1-yr', '0.0%;[Red]-0.0%'],
   ['Analyst target', 'Analyst target', '#,##0.00'], ['PEG', 'PEG', '0.00'],
   ['Expectations gap', 'Expectations gap (implied - expected growth)', '+0.0%;[Red]-0.0%'],
   ['Model vs analysts', 'Model vs analysts', '+0%;[Red]-0%'],
   ['Next earnings', 'Next earnings', '@'], ['Last EPS surprise', 'Last EPS surprise', '+0.0%;[Red]-0.0%'],
   ['EPS est. change 90d', 'EPS estimate change 90d', '+0.0%;[Red]-0.0%'], ['Revisions 30d', 'Analyst revisions 30d', '@'],
+  ['Price vs 200-day avg', 'Price vs 200-day average', '+0%;[Red]-0%'], ['Setup checks', 'Setup checks', '@'],
   ['Notes', 'Notes', '@']
 ];
 function watchCol_(header) {
@@ -1613,21 +1670,79 @@ function writeWatchlist_(formulasOnly) {
   if (!formulasOnly) { sh.setColumnWidth(2, 200); sh.setColumnWidth(3, 120); sh.setColumnWidth(4, 170); sh.setColumnWidth(WATCH_COLS.length, 360); }
 }
 
+/** Setups tab: holdings and watchlist stocks where several signals agree, strongest first. */
+var SETUP_COLS = [
+  ['Setup', 'Setup', '@', 170], ['Ticker', 'Ticker', '@', 70], ['Name', 'Name', '@', 190], ['List', 'List', '@', 80],
+  ['Sector', 'Sector', '@', 130], ['Price', 'Price', '#,##0.00', 75], ['Fair value', 'Fair value', '#,##0.00', 75],
+  ['Exp. return a year (5 yrs)', 'Exp. 5-yr return (a year)', '0.0%;[Red]-0.0%', 85],
+  ['Analyst target upside', 'Analyst target upside', '+0%;[Red]-0%', 80], ['Analysts', 'Analysts', '0', 65],
+  ['Direction', 'Direction', '@', 70], ['Implied growth', 'Implied growth (reverse DCF)', '0.0%', 80],
+  ['Revenue growth 1-yr', 'Revenue growth 1-yr', '0.0%;[Red]-0.0%', 80], ['ROIC', 'ROIC', '0.0%;[Red]-0.0%', 70],
+  ['EPS est. change 90d', 'EPS estimate change 90d', '+0.0%;[Red]-0.0%', 80], ['12m price change', '12m price change', '+0%;[Red]-0%', 80],
+  ['Price vs 200-day avg', 'Price vs 200-day average', '+0%;[Red]-0%', 80], ['Strength (of 7)', 'Setup strength (of 7)', '0', 70],
+  ['Checks', 'Setup checks', '@', 470]
+];
+var SETUP_HELP = [
+  ['What the setups mean', ''],
+  ['Value setup', 'At or below fair value, analysts see 15%+ upside (5+ analysts), estimates not being cut, Direction 60%+, price not in a downtrend.'],
+  ['Compounder', 'Looks expensive on fair value, but the price assumes less growth (Implied growth) than the company is delivering. ROIC 12%+, Direction 75%+, estimates rising, price above its 200-day average.'],
+  ['Value, waiting for trend', 'Cheap, but estimates are being cut or the price is still falling. Often early: wait for estimates or the trend to turn.'],
+  ['Trend broken', 'A quality grower, not cheap, with the price below its 200-day average and estimates falling (or the price 15%+ below it). For holdings: time to review or trim.'],
+  ['Thin targets', 'Analyst upside of 30%+ resting on fewer than 5 analysts, or fewer than 10 with the highest target over 3x the lowest. Treat the target with caution.'],
+  ['', ''],
+  ['Strength (of 7)', 'One point each: at/below fair value, analysts agree, estimates rising, Direction 75%+, price uptrend, ROIC 15%+, priced-in growth below actual growth.'],
+  ['Not a buy list', 'Setups are a shortlist to research. Loss-making and speculative stocks never qualify (except Thin targets).']
+];
+function writeSetups_(formulasOnly) {
+  var ss = SpreadsheetApp.getActive();
+  var isNew = !ss.getSheetByName(SHEET2.SETUPS);
+  var heads = SETUP_COLS.map(function (c) { return c[0]; });
+  var sh = ensureSheet_(SHEET2.SETUPS, heads);
+  sh.getRange(1, 1, 1, heads.length).setFontColor('#FFFFFF').setBackground('#1F3A5F').setWrap(true);
+  if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getMaxRows() - 1, heads.length).clearContent();
+  var col = function (h) { return 'Calc!' + calcL_(h) + '2:' + calcL_(h); };
+  var arr = '{' + SETUP_COLS.map(function (c) { return col(c[1]); }).join(',') + '}';
+  var cond = col('Setup') + '<>""';
+  sh.getRange('A2').setFormula('=IFERROR(SORT(FILTER(' + arr + ',' + cond + '),FILTER(' + col('Setup rank') + ',' + cond + '),TRUE,FILTER(' +
+    col('Setup strength (of 7)') + ',' + cond + '),FALSE),"No setups yet: run Valuation ▸ Recalculate valuations")');
+  SETUP_COLS.forEach(function (c, i) { sh.getRange(2, i + 1, 499, 1).setNumberFormat(c[2]); });
+  if (formulasOnly) return;
+  SETUP_COLS.forEach(function (c, i) { sh.setColumnWidth(i + 1, c[3]); });
+  sh.setFrozenColumns(2);
+  var hc = heads.length + 2;
+  if (sh.getMaxColumns() < hc + 1) sh.insertColumnsAfter(sh.getMaxColumns(), hc + 1 - sh.getMaxColumns());
+  sh.getRange(1, hc, SETUP_HELP.length, 2).setValues(SETUP_HELP).setWrap(true);
+  sh.getRange(1, hc, 1, 2).setFontWeight('bold');
+  sh.getRange(2, hc, SETUP_HELP.length - 1, 1).setFontWeight('bold');
+  sh.setColumnWidth(hc, 170); sh.setColumnWidth(hc + 1, 420);
+  if (isNew) {
+    try {
+      var w = ss.getSheetByName(SHEET2.WATCH);
+      if (w && ss.moveActiveSheet) { ss.setActiveSheet(sh); ss.moveActiveSheet(w.getIndex() + 1); }
+    } catch (e) { /* tab order is cosmetic */ }
+  }
+}
+
 /** Colours for Status and Signal columns (replaces earlier rules on these tabs). */
 function writeColourRules_() {
   var ss = SpreadsheetApp.getActive();
   var colours = { 'Stretched': '#F4C7C3', 'Above fair value': '#FCE8B2', 'Fair': '#E8EAED', 'Cheap': '#B7E1CD',
-    'Buy zone': '#B7E1CD', 'Approaching': '#D9EAD3', 'Value trap?': '#FCE8B2', 'Speculative': '#D9D2E9' };
-  var apply = function (sh, a1) {
-    var range = sh.getRange(a1), rules = [];
+    'Buy zone': '#B7E1CD', 'Approaching': '#D9EAD3', 'Value trap?': '#FCE8B2', 'Speculative': '#D9D2E9',
+    'Value setup': '#B7E1CD', 'Compounder': '#C9DAF8', 'Value, waiting for trend': '#FFF2CC', 'Trend broken': '#F4C7C3',
+    'Thin targets': '#E8EAED' };
+  var apply = function (sh, a1s) {
+    if (!sh) return;
+    var ranges = a1s.map(function (a) { return sh.getRange(a); }), rules = [];
     Object.keys(colours).forEach(function (k) {
-      rules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(k).setBackground(colours[k]).setRanges([range]).build());
+      rules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(k).setBackground(colours[k]).setRanges(ranges).build());
     });
     sh.setConditionalFormatRules(rules);
   };
-  apply(ss.getSheetByName(SHEET.HOLDINGS), holdingsCol_('Status') + '2:' + holdingsCol_('Status') + '500');
-  apply(ss.getSheetByName(SHEET2.WATCH), watchCol_('Signal') + '2:' + watchCol_('Signal') + '500');
-  apply(ss.getSheetByName(SHEET2.CALC), calcL_('Status') + '2:' + calcL_('Watch signal') + '500');
+  var span = function (L) { return L + '2:' + L + '500'; };
+  apply(ss.getSheetByName(SHEET.HOLDINGS), [span(holdingsCol_('Status')), span(holdingsCol_('Setup'))]);
+  apply(ss.getSheetByName(SHEET2.WATCH), [span(watchCol_('Signal')), span(watchCol_('Setup'))]);
+  apply(ss.getSheetByName(SHEET2.CALC), [calcL_('Status') + '2:' + calcL_('Watch signal') + '500', span(calcL_('Setup'))]);
+  apply(ss.getSheetByName(SHEET2.SETUPS), ['A2:A500']);
 }
 
 /* ======================================================================== */
@@ -1670,6 +1785,9 @@ function buildStockView_() {
   sh.getRange('M2').setFormula('=' + svLook_(SHEET2.CALC, 'Price')).setFontSize(16).setFontWeight('bold').setNumberFormat('#,##0.00');
   sh.getRange('N2:O2').merge().getCell(1, 1).setFormula('=' + svLook_(SHEET2.CALC, 'Status')).setFontWeight('bold').setHorizontalAlignment('center');
   sh.getRange('M3:O3').merge().getCell(1, 1).setFormula('="Data as of "&' + svLook_(SHEET2.CALC, 'Data as of')).setFontColor('#888780').setFontSize(9);
+
+  sh.getRange('D4:R4').merge().getCell(1, 1).setFormula('=IF(' + svLook_(SHEET2.CALC, 'Setup') + '="","No setup.   ","Setup: "&' + svLook_(SHEET2.CALC, 'Setup') + '&"   ")&' +
+    svLook_(SHEET2.CALC, 'Setup checks')).setFontWeight('bold').setFontColor('#1F3A5F');
 
   // Metric cards
   var cards = [['Fair value', 'Fair value', '#,##0.00'], ['Upside', 'Upside', '+0%;[Red]-0%'],
