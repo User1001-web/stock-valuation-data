@@ -303,6 +303,8 @@ async function addYahoo(rows, tickers) {
         if (typeof et['90daysAgo'] === 'number') r['EPS est 90d ago'] = et['90daysAgo'];
       }
       if (typeof er.upLast30days === 'number') r['Revisions up 30d'] = er.upLast30days;
+      const t5 = ((q.earningsTrend && q.earningsTrend.trend) || []).find(t => t.period === '+5y');
+      if (t5 && typeof t5.growth === 'number') r['Est EPS growth 5y'] = t5.growth;
       if (typeof er.downLast30days === 'number') r['Revisions down 30d'] = er.downLast30days;
       const fd = q.financialData || {}, tr = (q.earningsTrend && q.earningsTrend.trend) || [];
       const ap = q.assetProfile || {};

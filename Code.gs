@@ -138,7 +138,7 @@ var RAW_COLS = (function () {
   c.push('Est FY1 end', 'Est revenue FY1', 'Est revenue FY2', 'Est EPS FY1', 'Est EPS FY2', 'Est analysts',
     'Target consensus', 'Target high', 'Target low', 'Est FY2 end', 'Est source', 'Sector', 'Yahoo price', 'Yahoo industry',
     'Next earnings', 'Last EPS surprise', 'Last earnings quarter', 'EPS est now', 'EPS est 30d ago', 'EPS est 90d ago',
-    'Revisions up 30d', 'Revisions down 30d');
+    'Revisions up 30d', 'Revisions down 30d', 'Est EPS growth 5y');
   return c;
 })();
 
