@@ -1301,10 +1301,11 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
    Value setup  - at or below fair value, analysts see 15%+ upside, estimates not falling, trend not broken.
    Compounder   - looks expensive, but the price assumes less growth than the company delivers,
                   with high returns on capital, rising estimates and a rising price.
-   Value, waiting for trend - cheap, but estimates or the price are still falling.
-   Trend broken - a quality grower that is not cheap, with the price and estimates turning down.
+   Quality pullback - quality business, analysts raising estimates, but the price has fallen below its 200-day average.
+   Value, waiting for trend - cheap, but estimates are being cut, or the price is falling without estimates rising.
+   Trend broken - a quality grower that is not cheap, with the price falling and estimates no longer rising.
    Thin targets - big analyst upside resting on few analysts or a very wide range of targets. */
-var SETUP_RANK = { 'Value setup': 1, 'Compounder': 2, 'Value, waiting for trend': 3, 'Trend broken': 4, 'Thin targets': 5 };
+var SETUP_RANK = { 'Value setup': 1, 'Compounder': 2, 'Quality pullback': 3, 'Value, waiting for trend': 4, 'Trend broken': 5, 'Thin targets': 6 };
 function setupFor_(out, raw, price, eps, type, S) {
   out.setup = ''; out.setupScore = null; out.setupChecks = ''; out.setupRank = '';
   if (!price || !out.fv) return;
@@ -1332,8 +1333,9 @@ function setupFor_(out, raw, price, eps, type, S) {
   if (!spec && cheap && analystsAgree && !estDown && dir >= 0.6 && !trendDown) s = 'Value setup';
   else if (!spec && !cheap && roic !== null && roic >= 0.12 && dir >= 0.75 && growth >= 0.12 && pricedIn && estUp &&
     trendUp !== false && (tUp === null || tUp > 0)) s = 'Compounder';
+  else if (!spec && trendDown && estUp && dir >= 0.6 && roic !== null && roic >= 0.12 && analystsAgree && (cheap || pricedIn)) s = 'Quality pullback';
   else if (!spec && cheap && dir >= 0.5 && (estDown || trendDown)) s = 'Value, waiting for trend';
-  else if (!spec && !cheap && roic !== null && roic >= 0.12 && growth >= 0.1 && ((trendDown && estDown) || (v2 !== null && v2 < -0.15))) s = 'Trend broken';
+  else if (!spec && !cheap && roic !== null && roic >= 0.12 && growth >= 0.1 && !estUp && (trendDown || (v2 !== null && v2 < -0.15))) s = 'Trend broken';
   else if (tUp !== null && tUp >= 0.3 && thin) s = 'Thin targets';
   out.setup = s; out.setupRank = s ? SETUP_RANK[s] : '';
   var tick = function (b) { return b === null ? '–' : b ? '✓' : '✗'; };
@@ -1686,8 +1688,9 @@ var SETUP_HELP = [
   ['What the setups mean', ''],
   ['Value setup', 'At or below fair value, analysts see 15%+ upside (5+ analysts), estimates not being cut, Direction 60%+, price not in a downtrend.'],
   ['Compounder', 'Looks expensive on fair value, but the price assumes less growth (Implied growth) than the company is delivering. ROIC 12%+, Direction 75%+, estimates rising, price above its 200-day average.'],
-  ['Value, waiting for trend', 'Cheap, but estimates are being cut or the price is still falling. Often early: wait for estimates or the trend to turn.'],
-  ['Trend broken', 'A quality grower, not cheap, with the price below its 200-day average and estimates falling (or the price 15%+ below it). For holdings: time to review or trim.'],
+  ['Quality pullback', 'ROIC 12%+, analysts raising estimates and seeing 15%+ upside, but the price has fallen 5%+ below its 200-day average. Either cheap, or priced for less growth than delivered. Often the chance to buy a strong performer on a dip.'],
+  ['Value, waiting for trend', 'Cheap, but estimates are being cut, or the price is falling without estimates rising. Often early: wait for estimates or the trend to turn.'],
+  ['Trend broken', 'A quality grower, not cheap, with the price 5%+ below its 200-day average and estimates no longer rising. For holdings: time to review or trim.'],
   ['Thin targets', 'Analyst upside of 30%+ resting on fewer than 5 analysts, or fewer than 10 with the highest target over 3x the lowest. Treat the target with caution.'],
   ['', ''],
   ['Strength (of 7)', 'One point each: at/below fair value, analysts agree, estimates rising, Direction 75%+, price uptrend, ROIC 15%+, priced-in growth below actual growth.'],
@@ -1728,7 +1731,7 @@ function writeColourRules_() {
   var ss = SpreadsheetApp.getActive();
   var colours = { 'Stretched': '#F4C7C3', 'Above fair value': '#FCE8B2', 'Fair': '#E8EAED', 'Cheap': '#B7E1CD',
     'Buy zone': '#B7E1CD', 'Approaching': '#D9EAD3', 'Value trap?': '#FCE8B2', 'Speculative': '#D9D2E9',
-    'Value setup': '#B7E1CD', 'Compounder': '#C9DAF8', 'Value, waiting for trend': '#FFF2CC', 'Trend broken': '#F4C7C3',
+    'Value setup': '#B7E1CD', 'Compounder': '#C9DAF8', 'Quality pullback': '#D0E0E3', 'Value, waiting for trend': '#FFF2CC', 'Trend broken': '#F4C7C3',
     'Thin targets': '#E8EAED' };
   var apply = function (sh, a1s) {
     if (!sh) return;
