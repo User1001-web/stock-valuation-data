@@ -515,13 +515,12 @@ function keyMap_(s) { var m = {}; s.forEach(function (f) { m[f.start + '|' + f.e
  * Revenue decides which side is wrong: net income far below 1/300 of revenue is
  * taken as the slip; otherwise the share count is.
  */
-function fixScaleSlips_(F) {
+function fixScaleSlips_(F, anchor) {
   var eps = keyMap_(F.EPS.merged), sh = keyMap_(F.DilutedShares.merged), rev = keyMap_(F.Revenue.merged);
   var fixed = {}, notes = [];
-  // Share counts 1,000x (or 1,000,000x) away from the company's median share count are filer slips.
-  var shVals = F.DilutedShares.merged.map(function (f) { return f.val; }).filter(function (v) { return v > 0; });
-  if (shVals.length >= 3) {
-    var med = median_(shVals);
+  // Share counts 1,000x (or 1,000,000x) away from the latest cover-page share count are filer slips.
+  if (anchor > 0) {
+    var med = anchor;
     F.DilutedShares.byTag.forEach(function (s) {
       s.forEach(function (f) {
         if (!(f.val > 0)) return;
@@ -543,7 +542,12 @@ function fixScaleSlips_(F) {
       if (!rv || !rv.val) return;
       var niPlausible = Math.abs(f.val) * 300 >= Math.abs(rv.val) && Math.abs(f.val) <= 300 * Math.abs(rv.val);
       if (!niPlausible) { f.val = f.val / Math.pow(1000, step); notes.push('net income ' + f.end); }
-      else if (!fixed[k]) { n.val = n.val * Math.pow(1000, step); fixed[k] = 1; notes.push('share count ' + f.end); }
+      else if (!fixed[k]) {
+        var nv = n.val * Math.pow(1000, step);
+        // Only accept if the repaired count is closer to the cover-page share count (when known)
+        if (anchor > 0 && Math.abs(Math.log(nv / anchor)) >= Math.abs(Math.log(n.val / anchor))) return;
+        n.val = nv; fixed[k] = 1; notes.push('share count ' + f.end);
+      }
     });
   });
   return notes;
@@ -725,7 +729,9 @@ function parseCompany(ticker, cik, facts, sub) {
   FLOW_FIELDS.forEach(function (f) { F[f] = fieldSeries_(ns, map[f], 'money', ccy); });
   F.EPS = fieldSeries_(ns, map.EPS, 'pershare', ccy);
   F.DilutedShares = fieldSeries_(ns, map.DilutedShares, 'shares', ccy);
-  var slips = fixScaleSlips_(F);
+  var coverS = facts.facts.dei && facts.facts.dei.EntityCommonStockSharesOutstanding ?
+    instantSeries_(facts.facts.dei, ['EntityCommonStockSharesOutstanding'], 'shares', ccy) : [];
+  var slips = fixScaleSlips_(F, coverS.length ? coverS[0].val : null);
   if (slips.length) notes.push('Corrected filer scaling slip in ' + slips.slice(0, 4).join(', ') + (slips.length > 4 ? ' and ' + (slips.length - 4) + ' more' : ''));
 
   // Gross profit: fill missing periods with revenue − cost of revenue.
