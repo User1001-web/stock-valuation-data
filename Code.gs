@@ -1981,8 +1981,8 @@ function renderStockView_() {
   sh.getRange(SV.NOTE_CELL).setValue(t ? getNote_(t) : '');
   var grid = t ? sensitivityFor_(t) : null;
   var G0 = SV.GRID_ROW, C0 = SV.GRID_COL;
-  var area = sh.getRange(G0, C0, 7, 6);
-  area.clearContent().setBackground(null).setFontWeight('normal');
+  var area = sh.getRange(G0, C0, 10, 8);
+  area.breakApart().clearContent().setBackground(null).setFontWeight('normal');
   if (!grid) { sh.getRange(G0, C0).setValue('No valuation for this stock.'); return; }
   var out = [['Start growth ↓  Discount rate →'].concat(grid.rVals.map(function (r) { return r; }))];
   grid.gVals.forEach(function (g, i) { out.push([g].concat(grid.rows[i])); });
@@ -1997,7 +1997,7 @@ function renderStockView_() {
     bg[grid.baseRow][grid.baseCol] = '#CECBF6';
     cells.setBackgrounds(bg);
   }
-  sh.getRange(G0 + 6, C0, 1, 6).merge().getCell(1, 1).setValue('Shaded green where fair value is above today\'s price, red where below. Purple = current settings.')
+  sh.getRange(G0 + 1 + grid.gVals.length, C0, 1, 8).merge().getCell(1, 1).setValue('Shaded green where fair value is above today\'s price, red where below. Purple = current settings.')
     .setFontColor('#888780').setFontSize(9);
 }
 
@@ -2031,8 +2031,16 @@ function sensitivityFor_(t) {
   }
   var base = valueCompany(raw, m, fx, ovr, S, null, today);
   if (!base.fv || base.g0 === undefined || base.r === undefined) return null;
-  var gVals = [-0.10, -0.05, 0, 0.05, 0.10].map(function (d) { return clamp_(base.g0 + d, S.gFloor, Math.max(S.gCap, base.g0 + d)); });
-  var rVals = [-0.02, -0.01, 0, 0.01, 0.02].map(function (d) { return Math.max(base.r + d, S.gTerm + 0.02); });
+  // Growth: 4 steps down, 2 up. Discount rate: 2 steps down, 4 up. Duplicate rows (growth floor) are dropped.
+  var gVals = [], rVals = [];
+  [-0.20, -0.15, -0.10, -0.05, 0, 0.05, 0.10].forEach(function (d) {
+    var g = d === 0 ? base.g0 : clamp_(base.g0 + d, S.gFloor, Math.max(S.gCap, base.g0 + d));
+    if (gVals.every(function (x) { return Math.abs(x - g) > 1e-9; })) gVals.push(g);
+  });
+  [-0.02, -0.01, 0, 0.01, 0.02, 0.03, 0.04].forEach(function (d) {
+    var r = d === 0 ? base.r : Math.max(base.r + d, S.gTerm + 0.02);
+    if (rVals.every(function (x) { return Math.abs(x - r) > 1e-9; })) rVals.push(r);
+  });
   var rows = gVals.map(function (g) {
     return rVals.map(function (r) {
       var S2 = {}; for (var k in S) S2[k] = S[k];
@@ -2041,7 +2049,7 @@ function sensitivityFor_(t) {
       return v.fv ? v.fv : '';
     });
   });
-  return { gVals: gVals, rVals: rVals, rows: rows, baseRow: 2, baseCol: 2, price: m.price || n_(calc.Price) };
+  return { gVals: gVals, rVals: rVals, rows: rows, baseRow: gVals.indexOf(base.g0), baseCol: rVals.indexOf(base.r), price: m.price || n_(calc.Price) };
 }
 
 /** Menu: show the ticker in the selected row (any tab) on the Stock view. */
