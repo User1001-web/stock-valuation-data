@@ -1883,17 +1883,23 @@ function buildStockView_() {
   // T4 price history: one price pull (about 21 months), then a last-12-months table with a
   // 200-day average (about 290 calendar days) and the fair value line, using plain formulas only.
   var sym = 'IFERROR(VLOOKUP(SV_TICKER,Market!$A:$B,2,FALSE),SV_TICKER)';
-  var P = colL_(H + 6), Q = colL_(H + 7), T = colL_(H + 10), FVC = colL_(H + 14);
+  // Price table: Date | Price | 200-day avg | Fair value | 15% / 30% / 50% below fair value | Analyst target.
+  // Fair value and target are held as single cells in row 1 of columns H+18 and H+19.
+  var P = colL_(H + 6), Q = colL_(H + 7), T = colL_(H + 10), FVC = colL_(H + 18), TGC = colL_(H + 19);
   sh.getRange(1, H + 6).setFormula('=IFERROR(GOOGLEFINANCE(' + sym + ',"close",TODAY()-660,TODAY()),"")');
-  sh.getRange(1, H + 14).setFormula('=N(' + svLook_(SHEET2.CALC, 'Fair value') + ')');
-  sh.getRange(1, H + 10, 1, 4).setValues([['Date', 'Price', '200-day average', 'Fair value']]);
+  sh.getRange(1, H + 18).setFormula('=N(' + svLook_(SHEET2.CALC, 'Fair value') + ')');
+  sh.getRange(1, H + 19).setFormula('=N(' + svLook_(SHEET2.CALC, 'Analyst target') + ')');
+  sh.getRange(1, H + 10, 1, 8).setValues([['Date', 'Price', '200-day average', 'Fair value', '15% below fair value',
+    '30% below fair value', '50% below fair value', 'Analyst target']]);
   sh.getRange(2, H + 10).setFormula('=IFERROR(FILTER(' + P + '2:' + Q + '700,ISNUMBER(' + Q + '2:' + Q + '700),' + P + '2:' + P + '700>=TODAY()-365),"")');
   var rows = [];
+  var lvl = function (pr, expr, ref) { return '=IF(AND(ISNUMBER(' + T + pr + '),$' + ref + '$1>0),' + expr + ',"")'; };
   for (var pr = 2; pr <= 300; pr++) {
     rows.push(['=IF(ISNUMBER(' + T + pr + '),AVERAGEIFS($' + Q + '$2:$' + Q + '$700,$' + P + '$2:$' + P + '$700,">"&(' + T + pr + '-290),$' + P + '$2:$' + P + '$700,"<="&' + T + pr + '),"")',
-      '=IF(AND(ISNUMBER(' + T + pr + '),$' + FVC + '$1>0),$' + FVC + '$1,"")']);
+      lvl(pr, '$' + FVC + '$1', FVC), lvl(pr, '$' + FVC + '$1*0.85', FVC), lvl(pr, '$' + FVC + '$1*0.7', FVC),
+      lvl(pr, '$' + FVC + '$1*0.5', FVC), lvl(pr, '$' + TGC + '$1', TGC)]);
   }
-  sh.getRange(2, H + 12, rows.length, 2).setFormulas(rows);
+  sh.getRange(2, H + 12, rows.length, 6).setFormulas(rows);
   sh.getRange(2, H + 10, 299, 1).setNumberFormat('d mmm yy');
   sh.hideColumns(H, 20);
 
@@ -1907,10 +1913,13 @@ function buildStockView_() {
     .setOption('colors', ['#5DCAA5', '#185FA5']).setOption('legend', { position: 'bottom' }).setOption('vAxis', { title: 'Value per share' }), 10, 10, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.COLUMN).addRange(hr(19, 0, 8, 3)).setNumHeaders(1)
     .setOption('colors', ['#85B7EB', '#1D9E75']).setOption('legend', { position: 'bottom' }).setOption('vAxis', { title: 'Millions' }), 29, 2, SV.CW, SV.CH);
-  add(sh.newChart().setChartType(Charts.ChartType.LINE).addRange(sh.getRange(1, H + 10, 300, 4)).setNumHeaders(1)
+  add(sh.newChart().setChartType(Charts.ChartType.LINE).addRange(sh.getRange(1, H + 10, 300, 8)).setNumHeaders(1)
     .setOption('vAxis', { title: 'Price' }).setOption('hAxis', { format: 'MMM yy' })
-    .setOption('colors', ['#378ADD', '#888780', '#0F6E56']).setOption('legend', { position: 'bottom' })
-    .setOption('series', { 1: { lineDashStyle: [3, 3] }, 2: { lineDashStyle: [8, 4] } }), 29, 18, SV.CW, SV.CH);
+    .setOption('colors', ['#378ADD', '#888780', '#0F6E56', '#5DCAA5', '#97C459', '#C0DD97', '#7F77DD'])
+    .setOption('legend', { position: 'bottom' })
+    .setOption('series', { 0: { lineWidth: 2.5 }, 1: { lineDashStyle: [3, 3], lineWidth: 1.5 }, 2: { lineDashStyle: [8, 4], lineWidth: 2 },
+      3: { lineDashStyle: [2, 3], lineWidth: 1 }, 4: { lineDashStyle: [2, 3], lineWidth: 1 }, 5: { lineDashStyle: [2, 3], lineWidth: 1 },
+      6: { lineDashStyle: [10, 4], lineWidth: 1.5 } }), 29, 18, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.COLUMN).addRange(hr(28, 0, 9, 3)).setNumHeaders(1).setOption('isStacked', true)
     .setOption('colors', ['#378ADD', '#AFA9EC']).setOption('legend', { position: 'bottom' }).setOption('vAxis', { title: 'EPS per share' }), 29, 10, SV.CW, SV.CH);
   add(sh.newChart().setChartType(Charts.ChartType.LINE).addRange(hr(38, 0, 8, 4)).setNumHeaders(1)
