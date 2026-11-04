@@ -1584,9 +1584,11 @@ function fxRates_(pairs) {
   return out;
 }
 
-/** History: weekly snapshot of price, fair value and direction score per ticker. */
+/** History: weekly snapshot per ticker. Setup and analyst columns let the setups be tested later on real outcomes. */
+var HIST_COLS = ['Date', 'Ticker', 'Price', 'Fair value', 'Direction score', 'Setup', 'Setup strength', 'Analyst target',
+  'Analysts', 'EPS estimate change 90d', 'Price vs 200-day average', 'Free cash flow margin'];
 function historyIndex_(today) {
-  var sh = ensureSheet_(SHEET2.HIST, ['Date', 'Ticker', 'Price', 'Fair value', 'Direction score']);
+  var sh = ensureSheet_(SHEET2.HIST, HIST_COLS);
   var out = {};
   if (sh.getLastRow() < 2) return out;
   sh.getRange(2, 1, sh.getLastRow() - 1, 5).getValues().forEach(function (r) {
@@ -1609,10 +1611,12 @@ function snapshotHistory_(rows, today) {
   var mv = SpreadsheetApp.getActive().getSheetByName(SHEET.MARKET);
   if (mv.getLastRow() > 1) mv.getRange(2, 1, mv.getLastRow() - 1, 4).getValues().forEach(function (r) { mk[String(r[0]).toUpperCase()] = r[3]; });
   var now = new Date();
-  var add = rows.filter(function (v) { return v.fv; }).map(function (v) {
-    return [now, v.ticker, typeof mk[v.ticker] === 'number' ? mk[v.ticker] : '', v.fv, v.score === undefined ? '' : v.score];
+  var add = rows.filter(function (v) { return v.fv || v.setup; }).map(function (v) {
+    var x = function (k) { return v[k] === undefined || v[k] === null || (typeof v[k] === 'number' && !isFinite(v[k])) ? '' : v[k]; };
+    return [now, v.ticker, typeof mk[v.ticker] === 'number' ? mk[v.ticker] : '', v.fv, x('score'), x('setup'), x('setupScore'),
+      x('analystTarget'), x('analysts'), x('estChg90'), x('vs200'), x('fcfMargin')];
   });
-  if (add.length) sh.getRange(sh.getLastRow() + 1, 1, add.length, 5).setValues(add);
+  if (add.length) sh.getRange(sh.getLastRow() + 1, 1, add.length, HIST_COLS.length).setValues(add);
 }
 
 /** Bond yields from data/rates.csv (written by the GitHub job from FRED). */
