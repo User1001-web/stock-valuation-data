@@ -914,25 +914,30 @@ function mean_(a) { a = a.filter(function (x) { return x !== null && isFinite(x)
 function median_(a) { a = a.slice().sort(function (x, y) { return x - y; }); var k = a.length; return k ? (k % 2 ? a[(k - 1) / 2] : (a[k / 2 - 1] + a[k / 2]) / 2) : null; }
 
 /** Growth path: year-1 rate g0 fading in a straight line to terminal growth in year 10. */
-function growthPath_(g0, gT) {
+function growthPath_(g0, gT, lead) {
   var p = [];
-  for (var t = 1; t <= 10; t++) p.push(g0 + (gT - g0) * (t - 1) / 9);
+  if (lead && lead.n > 0) {
+    // Years 1..n at the analysts' forecast growth, then a linear fade from g0 to terminal by year 10.
+    for (var t = 1; t <= 10; t++) p.push(t <= lead.n ? lead.g : g0 + (gT - g0) * (t - lead.n - 1) / (9 - lead.n));
+    return p;
+  }
+  for (var u = 1; u <= 10; u++) p.push(g0 + (gT - g0) * (u - 1) / 9);
   return p;
 }
 function grow_(base, path, years) { var v = base; for (var t = 0; t < years; t++) v *= 1 + path[t]; return v; }
 function exitMultiple_(laterGrowth, cap) { return clamp_(8.5 + 2 * laterGrowth * 100, 8, cap); }
 
 /** Two-stage DCF per share: 10 years on the growth path, then a terminal value. */
-function dcfPerShare_(fcf0, g0, gT, r, netCash, shares) {
-  var path = growthPath_(g0, gT), cf = fcf0, pv = 0;
+function dcfPerShare_(fcf0, g0, gT, r, netCash, shares, lead) {
+  var path = growthPath_(g0, gT, lead), cf = fcf0, pv = 0;
   for (var t = 1; t <= 10; t++) { cf *= 1 + path[t - 1]; pv += cf / Math.pow(1 + r, t); }
   var tv = cf * (1 + gT) / (r - gT) / Math.pow(1 + r, 10);
   return (pv + tv + netCash) / shares;
 }
 
 /** Revenue-based 5-year projection: revenue x margin x exit multiple, per future share, discounted. */
-function projection5_(rev0, g0, gT, margin, mult, shares, dil, req, years) {
-  var path = growthPath_(g0, gT);
+function projection5_(rev0, g0, gT, margin, mult, shares, dil, req, years, lead) {
+  var path = growthPath_(g0, gT, lead);
   var rev5 = grow_(rev0, path, years === undefined ? 5 : years);
   var sh5 = shares * Math.pow(1 + dil, 5);
   var target = rev5 * margin * mult / sh5;
@@ -1039,12 +1044,21 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
 
   // Classification
   var sic = Number(raw.SIC) || 0;
+  var cyclicalSic = (sic >= 1000 && sic <= 1499) || (sic >= 2800 && sic <= 2999) || (sic >= 3300 && sic <= 3399) ||
+    (sic >= 3670 && sic <= 3679) || (sic >= 3711 && sic <= 3716) || (sic >= 4400 && sic <= 4499);
+  var established = (fy('Revenue', 3) || 0) >= 5e9;
+  // Cycle trough: an established cyclical company losing money now but profitable over its last three fiscal years
+  // (median net margin 3%+). Valued on typical-cycle margins instead of as a loss-maker.
+  var prevNet = [];
+  for (var pi = 1; pi <= 3; pi++) { var pn = fy('NetIncome', pi), pr = fy('Revenue', pi); if (pn !== null && pr) prevNet.push(pn / pr); }
+  var trough = cyclicalSic && established && ni !== null && ni <= 0 && prevNet.length >= 2 && median_(prevNet) >= 0.03 && rev > 0;
+  out.cycleTrough = trough;
   var type;
   var ovType = String(ovr.type || '').trim();
   if (ovType && MODELS_BY_TYPE[ovType]) { type = ovType; out.notes.push('Type set by override'); }
   else if (((sic >= 6000 && sic <= 6299) || sic === 6726) && !(rev && capex / rev > 0.1)) type = 'Financial';
   else if ((raw.CIK === 'LSE' && !raw.Sector) || ((raw.CIK === 'LSE' || raw.CIK === 'YAHOO') && (raw.Sector === 'Financial Services' || raw.Sector === 'Real Estate'))) type = 'Financial';
-  else if (ni === null || ni <= 0) type = 'Pre-profit';
+  else if ((ni === null || ni <= 0) && !trough) type = 'Pre-profit';
   else if ((mean_([yoy, cagr3]) || 0) >= S.growthThreshold) type = 'Growth';
   else type = 'Mature';
   out.type = type;
@@ -1061,7 +1075,9 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var fy0End = raw['Latest FY end'], fy2End = raw['Est FY2 end'] || '';
   var estYears = fy0End && fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - dnum_(String(fy0End).slice(0, 10))) / 365.25, 1, 3.5) : 2;
   var yearsAhead = fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - today) / 365.25, 0.5, 3) : 2;
-  if (ovG !== null) { g0 = ovG > 1.5 ? ovG / 100 : ovG; basis = 'Override'; }
+  var gridG = n_(ovr.gridGrowth);   // set only by the Stock view sensitivity grid
+  if (gridG !== null) { g0 = gridG; basis = 'Sensitivity scenario'; }
+  else if (ovG !== null) { g0 = ovG > 1.5 ? ovG / 100 : ovG; basis = 'Override'; }
   else if (consensus) {
     g0 = Math.pow(estRev2 / r0, 1 / estYears) - 1;
     basis = 'Analyst consensus revenue growth (' + (n_(raw['Est analysts']) || '?') + ' analysts, ' + (raw['Est source'] || 'estimates') + ')';
@@ -1071,11 +1087,19 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     basis = yoy !== null && cagr3 !== null ? 'Avg of 1-yr and 3-yr revenue growth' : yoy !== null ? '1-yr revenue growth' : cagr3 !== null ? '3-yr revenue growth' : 'No history (terminal rate)';
   }
   var g0raw = g0;
-  g0 = clamp_(g0, S.gFloor, S.gCap);
-  if (g0 !== g0raw && basis !== 'Override') basis += g0raw > g0 ? ' (capped)' : ' (floored)';
-  var gT = S.gTerm, path = growthPath_(g0, gT);
+  var leadOK = consensus && ovG === null && ni !== null && ni > 0 && type !== 'Financial' && (n_(raw['Est analysts']) || 0) >= 5;
+  g0 = clamp_(g0, S.gFloor, gridG !== null && !leadOK ? Math.max(S.gCap, gridG) : S.gCap);
+  // Profitable companies with 5+ analysts: trust the consensus for the forecast years even above the cap,
+  // then fade from the cap. Loss-makers and thinly covered stocks stay capped from year 1.
+  var lead = null;
+  if (leadOK && g0raw > S.gCap) {
+    lead = { g: Math.min(g0raw, 1), n: 2 };
+    basis += ' for 2 years, then fading from ' + Math.round(S.gCap * 100) + '%';
+  } else if (g0 !== g0raw && basis !== 'Override' && gridG === null) basis += g0raw > g0 ? ' (capped)' : ' (floored)';
+  if (trough && !consensus && ovG === null && gridG === null && g0 < S.gTerm) { g0 = S.gTerm; basis = 'Cycle trough: terminal growth assumed'; }
+  var gT = S.gTerm, path = growthPath_(g0, gT, lead);
   var avgRange = function (a, b) { return mean_(path.slice(a - 1, b)); };
-  out.g0 = g0; out.gBasis = basis;
+  out.g0 = lead ? lead.g : g0; out.gBasis = basis;
 
   var beta = n_(mkt.beta);
   if (beta === null) { beta = S.betaDefault; out.notes.push('No beta; ' + beta + ' assumed'); }
@@ -1115,14 +1139,10 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   mF = Math.min(mF, 0.6); mN = Math.min(mN, 0.6);
 
   // Possible cyclical peak: an established company (revenue >= 5bn three years ago) in a cyclical industry, revenue up >50% in a year AND net margin
-  // more than double last year's. Valuing peak profits with growth on top overstates value,
-  // so margins revert to the cycle average (this year + 3 prior) and growth starts at terminal.
-  var prevNet = [];
-  for (var pi = 1; pi <= 3; pi++) { var pn = fy('NetIncome', pi), pr = fy('Revenue', pi); if (pn !== null && pr) prevNet.push(pn / pr); }
+  // more than double last year's. Peak margins revert to the cycle average. Growth follows the analysts when they
+  // forecast revenue to keep rising; otherwise it starts at the 3-year rate (at most 15%), never zero.
   var lastYear = prevNet.length ? prevNet[0] : null;
-  var cyclicalSic = (sic >= 1000 && sic <= 1499) || (sic >= 2800 && sic <= 2999) || (sic >= 3300 && sic <= 3399) ||
-    (sic >= 3670 && sic <= 3679) || (sic >= 3711 && sic <= 3716) || (sic >= 4400 && sic <= 4499);
-  var established = (fy('Revenue', 3) || 0) >= 5e9;
+  var analystsSeeGrowth = consensus && estRev2 >= (rev || 0) * 0.95;
   var peak = cyclicalSic && established && (ovG === null || ovr.keepPeak) && ovM === null && yoy !== null && yoy > 0.5 && netMarginNow !== null &&
     lastYear !== null && netMarginNow > 0 && netMarginNow > 2 * Math.max(lastYear, 0.02);
   out.cyclicalPeak = peak;
@@ -1137,12 +1157,22 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     out.notes.push('Earnings look depressed by one-off charges (TTM net margin ' + Math.round(netMarginNow * 100) +
       '% vs typical ' + Math.round(medNet * 100) + '%); earnings models use the typical margin');
   }
+  if (trough) {
+    var tNet = median_(prevNet);
+    var tFcf = fcfFY.length ? median_(fcfFY) : null;
+    mN = Math.max(mN, tNet); if (!(tFcf > 0)) tFcf = tNet; mF = Math.max(Math.min(mF, 0.6), tFcf);
+    epsBase = rev * tNet / shares; fcfBase = rev * mF;
+    out.notes.push('Cycle trough: losing money now but typically profitable (median net margin ' + Math.round(tNet * 100) + '%); valued on typical-cycle margins');
+  }
   if (peak) {
     var cycNet = mean_([netMarginNow].concat(prevNet)), cycFcf = mean_([fcfMarginNow, fcfMarginAvg]);
     mN = Math.max(cycNet, 0.01); mF = Math.max(cycFcf || cycNet, 0.01);
     fcfBase = rev * mF; epsBase = rev * mN / shares;
-    if (!consensus && ovG === null) { g0 = gT; path = growthPath_(g0, gT); out.g0 = g0; out.gBasis = 'Cyclical peak: no growth assumed'; }
-    out.notes.push('Possible cyclical peak: average-cycle margins used' + (consensus ? '' : ' and no growth') + ' (override on Tickers to change)');
+    if (!analystsSeeGrowth && ovG === null && gridG === null) {
+      g0 = clamp_(cagr3 === null ? gT : cagr3, gT, 0.15); lead = null; path = growthPath_(g0, gT); out.g0 = g0;
+      out.gBasis = 'Cyclical peak: 3-yr growth, at most 15%';
+    }
+    out.notes.push('Possible cyclical peak: average-cycle margins used' + (analystsSeeGrowth ? ', analysts\' growth kept' : ', growth from 3-yr rate (max 15%)') + ' (override on Tickers to change)');
   }
 
   // Dilution (ignores share-count jumps that look like splits)
@@ -1160,13 +1190,20 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     projRev = estRev2; projYears = Math.max(1, Math.round(5 - yearsAhead)); hasRev = true;
     out.notes.push('Pre-revenue: valued from analysts\' revenue forecast');
   }
-  var peLater = exitMultiple_(avgRange(6, 10), S.peCap);
-  var pfLater = exitMultiple_(avgRange(6, 10), S.pfcfCap);
+  // Exit multiples: high-return businesses (ROIC 20%+, not at a cyclical peak) may keep a higher multiple.
+  var taxR = F('IncomeTax TTM') !== null && F('PretaxIncome TTM') ? clamp_(F('IncomeTax TTM') / F('PretaxIncome TTM'), 0, 0.35) : 0.21;
+  var icE = (equity || 0) + debt - cash, opE = F('OperatingIncome TTM');
+  var roicE = opE !== null && icE > 0 ? opE * (1 - taxR) / icE : null;
+  var qualityMult = !peak && (type === 'Growth' || type === 'Mature') && roicE !== null && roicE >= 0.2;
+  var peCapX = qualityMult ? S.peCap * 1.4 : S.peCap, pfCapX = qualityMult ? S.pfcfCap * 1.4 : S.pfcfCap;
+  var peLater = exitMultiple_(avgRange(6, 10), peCapX);
+  var pfLater = exitMultiple_(avgRange(6, 10), pfCapX);
+  if (qualityMult && exitMultiple_(avgRange(6, 10), S.peCap) >= S.peCap) out.notes.push('High-return business (ROIC ' + Math.round(roicE * 100) + '%): exit P/E cap raised to ' + Math.round(peCapX));
 
-  if (fcfBase !== null && fcfBase > 0 && type !== 'Financial') M['DCF'] = dcfPerShare_(fcfBase, g0, gT, r, netCash, shares);
+  if (fcfBase !== null && fcfBase > 0 && type !== 'Financial') M['DCF'] = dcfPerShare_(fcfBase, g0, gT, r, netCash, shares, lead);
   if (hasRev && type !== 'Financial') {
-    M['FCF future market cap'] = projection5_(projRev, g0, gT, mF, pfLater, shares, dilP, S.req, projYears).fv;
-    var p5 = projection5_(projRev, g0, gT, mN, peLater, shares, dilP, S.req, projYears);
+    M['FCF future market cap'] = projection5_(projRev, g0, gT, mF, pfLater, shares, dilP, S.req, projYears, lead).fv;
+    var p5 = projection5_(projRev, g0, gT, mN, peLater, shares, dilP, S.req, projYears, lead);
     M['5-yr earnings'] = p5.fv;
     out.target5 = p5.target;
   }
@@ -1176,7 +1213,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     if (useEstEps) out.notes.push('Fwd EPS x P/E uses consensus EPS (analysts often use adjusted EPS)');
     var epsYears = useEstEps ? yearsAhead : 2;
     // Financials: modest multiple (banks/insurers rarely sustain growth multiples); growth from revenue is unreliable for them.
-    var fwdPE = type === 'Financial' ? clamp_(8.5 + 2 * Math.min(avgRange(3, 7), gT) * 100, 8, Math.min(S.peCap, 14.5)) : exitMultiple_(avgRange(3, 7), S.peCap);
+    var fwdPE = type === 'Financial' ? clamp_(8.5 + 2 * Math.min(avgRange(3, 7), gT) * 100, 8, Math.min(S.peCap, 14.5)) : exitMultiple_(avgRange(3, 7), peCapX);
     M['Fwd EPS x P/E'] = eps2 * fwdPE / Math.pow(1 + S.req, epsYears);
   }
   if (epsBase !== null && epsBase > 0) {
@@ -1305,9 +1342,18 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
    Value, waiting for trend - cheap, but estimates are being cut, or the price is falling without estimates rising.
    Trend broken - a quality grower that is not cheap, with the price falling and estimates no longer rising.
    Thin targets - big analyst upside resting on few analysts or a very wide range of targets. */
-var SETUP_RANK = { 'Value setup': 1, 'Compounder': 2, 'Quality pullback': 3, 'Value, waiting for trend': 4, 'Trend broken': 5, 'Thin targets': 6 };
+var SETUP_RANK = { 'Value setup': 1, 'Compounder': 2, 'Quality pullback': 3, 'Value, waiting for trend': 4, 'Trend broken': 5, 'Thin targets': 6, 'Cash burner': 7 };
 function setupFor_(out, raw, price, eps, type, S) {
   out.setup = ''; out.setupScore = null; out.setupChecks = ''; out.setupRank = '';
+  // Veto: burning cash AND priced far above fundamentals (over 3x fair value, or over 15x sales).
+  // In the 2023-26 back-test on your own trades, almost none of these beat the index.
+  if (price && out.fcfMargin !== null && out.fcfMargin !== undefined && out.fcfMargin < 0 &&
+      ((out.fv && price > 3 * out.fv) || (out.evSales !== null && out.evSales !== undefined && out.evSales > 15))) {
+    out.setup = 'Cash burner'; out.setupRank = SETUP_RANK['Cash burner']; out.setupScore = 0;
+    out.setupChecks = 'Negative free cash flow' + (out.fv ? ', price ' + (price / out.fv).toFixed(1) + 'x fair value' : '') +
+      (out.evSales > 15 ? ', ' + Math.round(out.evSales) + 'x sales' : '') + '. Avoid unless you have a strong, specific reason.';
+    return;
+  }
   if (!price || !out.fv) return;
   var exp = Math.pow(out.fv / price, 1 / 5) * (1 + S.req) - 1;
   var tUp = out.analystTarget ? out.analystTarget / price - 1 : null;
@@ -1693,6 +1739,7 @@ var SETUP_HELP = [
   ['Quality pullback', 'ROIC 12%+, analysts raising estimates and seeing 15%+ upside, but the price has fallen 5%+ below its 200-day average. Either cheap, or priced for less growth than delivered. Often the chance to buy a strong performer on a dip.'],
   ['Value, waiting for trend', 'Cheap, but estimates are being cut, or the price is falling without estimates rising. Often early: wait for estimates or the trend to turn.'],
   ['Trend broken', 'A quality grower, not cheap, with the price 5%+ below its 200-day average and estimates no longer rising. For holdings: time to review or trim.'],
+  ['Cash burner', 'Veto: negative free cash flow and priced over 3x fair value or 15x sales. In a back-test on your 2023-26 trades, almost none of these beat the S&P 500.'],
   ['Thin targets', 'Analyst upside of 30%+ resting on fewer than 5 analysts, or fewer than 10 with the highest target over 3x the lowest. Treat the target with caution.'],
   ['', ''],
   ['Strength (of 7)', 'One point each: at/below fair value, analysts agree, estimates rising, Direction 75%+, price uptrend, ROIC 15%+, priced-in growth below actual growth.'],
@@ -1734,7 +1781,7 @@ function writeColourRules_() {
   var colours = { 'Stretched': '#F4C7C3', 'Above fair value': '#FCE8B2', 'Fair': '#E8EAED', 'Cheap': '#B7E1CD',
     'Buy zone': '#B7E1CD', 'Approaching': '#D9EAD3', 'Value trap?': '#FCE8B2', 'Speculative': '#D9D2E9',
     'Value setup': '#B7E1CD', 'Compounder': '#C9DAF8', 'Quality pullback': '#D0E0E3', 'Value, waiting for trend': '#FFF2CC', 'Trend broken': '#F4C7C3',
-    'Thin targets': '#E8EAED' };
+    'Thin targets': '#E8EAED', 'Cash burner': '#E6B8AF' };
   var apply = function (sh, a1s) {
     if (!sh) return;
     var ranges = a1s.map(function (a) { return sh.getRange(a); }), rules = [];
@@ -2034,7 +2081,7 @@ function sensitivityFor_(t) {
   // Growth: 4 steps down, 2 up. Discount rate: 2 steps down, 4 up. Duplicate rows (growth floor) are dropped.
   var gVals = [], rVals = [];
   [-0.20, -0.15, -0.10, -0.05, 0, 0.05, 0.10].forEach(function (d) {
-    var g = d === 0 ? base.g0 : clamp_(base.g0 + d, S.gFloor, Math.max(S.gCap, base.g0 + d));
+    var g = d === 0 ? base.g0 : Math.max(base.g0 + d, S.gFloor);
     if (gVals.every(function (x) { return Math.abs(x - g) > 1e-9; })) gVals.push(g);
   });
   [-0.02, -0.01, 0, 0.01, 0.02, 0.03, 0.04].forEach(function (d) {
@@ -2044,9 +2091,11 @@ function sensitivityFor_(t) {
   var rows = gVals.map(function (g) {
     return rVals.map(function (r) {
       var S2 = {}; for (var k in S) S2[k] = S[k];
-      S2.rMin = r; S2.rMax = r; S2.gCap = Math.max(S.gCap, g); S2.req = Math.max(S.req + (r - base.r), S.gTerm + 0.02);
-      var v = valueCompany(raw, m, fx, { type: ovr.type, growth: g, margin: ovr.margin, keepPeak: true }, S2, null, today);
-      return v.fv ? v.fv : '';
+      S2.rMin = r; S2.rMax = r; S2.req = Math.max(S.req + (r - base.r), S.gTerm + 0.02);
+      var v = valueCompany(raw, m, fx, { type: ovr.type, growth: ovr.growth, margin: ovr.margin, gridGrowth: g }, S2, null, today);
+      // Blend the same models as the base fair value, so scenarios are comparable (no price filter re-selection).
+      var vals = (base.used || []).map(function (k) { return v.models[k]; }).filter(function (x) { return x > 0; });
+      return vals.length ? median_(vals) : (v.fv ? v.fv : '');
     });
   });
   return { gVals: gVals, rVals: rVals, rows: rows, baseRow: gVals.indexOf(base.g0), baseCol: rVals.indexOf(base.r), price: m.price || n_(calc.Price) };
