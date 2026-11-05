@@ -1341,6 +1341,22 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var tr = tax !== null && pre ? clamp_(tax / pre, 0, 0.35) : 0.21;
   var ic = (equity || 0) + debt - cash;
   out.roic = opInc !== null && ic > 0 ? opInc * (1 - tr) / ic : null;
+  // Debt safety (not meaningful for banks and insurers, whose borrowing is their raw material)
+  var da = F('DA TTM'), intExp = F('InterestExpense TTM');
+  // EBITDA: operating profit + depreciation & amortisation, cross-checked against operating cash flow + interest
+  // (filers often split or omit amortisation); the higher of the two is used.
+  var ebitda = opInc === null ? null : opInc + (da !== null ? Math.abs(da) : 0);
+  var ebitdaCF = ocf !== null ? ocf + (intExp ? Math.abs(intExp) : 0) : null;
+  if (ebitdaCF !== null && (ebitda === null || ebitdaCF > ebitda)) ebitda = ebitdaCF;
+  var netDebt = debt - cash;
+  out.ndEbitda = type === 'Financial' || ebitda === null ? null : netDebt <= 0 ? 0 : ebitda > 0 ? netDebt / ebitda : null;
+  // Interest cover on EBITDA, so amortisation of acquired intangibles does not make acquirers look distressed.
+  out.intCover = type === 'Financial' || ebitda === null || !intExp ? null : ebitda / Math.abs(intExp);
+  var utility = sic >= 4900 && sic <= 4999;   // regulated utilities normally carry more debt
+  out.highDebt = type !== 'Financial' && netDebt > 0 && ((out.ndEbitda !== null && out.ndEbitda > (utility ? 6 : 3.5)) ||
+    (out.intCover !== null && out.intCover < 3) || (ebitda !== null && ebitda <= 0));
+  if (out.highDebt) out.notes.push('High debt: ' + (out.ndEbitda !== null ? 'net debt ' + out.ndEbitda.toFixed(1) + 'x EBITDA' : 'net debt with no operating profit') +
+    (out.intCover !== null ? ', interest cover ' + out.intCover.toFixed(1) + 'x' : ''));
 
   // Direction signals: true = improving, false = worsening, null = not available
   var sig = out.signals;
@@ -1375,7 +1391,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
    Value, waiting for trend - cheap, but estimates are being cut, or the price is falling without estimates rising.
    Trend broken - a quality grower that is not cheap, with the price falling and estimates no longer rising.
    Thin targets - big analyst upside resting on few analysts or a very wide range of targets. */
-var SETUP_RANK = { 'Value setup': 1, 'Compounder': 2, 'Quality pullback': 3, 'Value, waiting for trend': 4, 'Trend broken': 5, 'Thin targets': 6, 'Cash burner': 7 };
+var SETUP_RANK = { 'Value setup': 1, 'Compounder': 2, 'Quality pullback': 3, 'Value, waiting for trend': 4, 'Trend broken': 5, 'High debt': 6, 'Thin targets': 7, 'Cash burner': 8 };
 function setupFor_(out, raw, price, eps, type, S) {
   out.setup = ''; out.setupScore = null; out.setupChecks = ''; out.setupRank = '';
   // Veto: burning cash AND priced far above fundamentals (over 3x fair value, or over 15x sales).
@@ -1409,7 +1425,9 @@ function setupFor_(out, raw, price, eps, type, S) {
   var analystsAgree = tUp !== null && tUp >= 0.15 && !thin;
 
   var s = '';
-  if (!spec && cheap && analystsAgree && !estDown && dir >= 0.6 && !trendDown) s = 'Value setup';
+  var debtOK = !out.highDebt;
+  if (!debtOK && !spec) s = 'High debt';
+  else if (!spec && cheap && analystsAgree && !estDown && dir >= 0.6 && !trendDown) s = 'Value setup';
   else if (!spec && !cheap && roic !== null && roic >= 0.12 && dir >= 0.75 && growth >= 0.12 && pricedIn && estUp &&
     trendUp !== false && (tUp === null || tUp > 0)) s = 'Compounder';
   else if (!spec && trendDown && estUp && dir >= 0.6 && roic !== null && roic >= 0.12 && analystsAgree && (cheap || pricedIn)) s = 'Quality pullback';
@@ -1418,11 +1436,12 @@ function setupFor_(out, raw, price, eps, type, S) {
   else if (tUp !== null && tUp >= 0.3 && thin) s = 'Thin targets';
   out.setup = s; out.setupRank = s ? SETUP_RANK[s] : '';
   var tick = function (b) { return b === null ? '–' : b ? '✓' : '✗'; };
-  out.setupScore = [cheap, analystsAgree, estUp, dir >= 0.75, trendUp === true, roic !== null && roic >= 0.15, pricedIn]
+  out.setupScore = [cheap, analystsAgree, estUp, dir >= 0.75, trendUp === true, roic !== null && roic >= 0.15, pricedIn && !out.highDebt]
     .filter(function (b) { return b; }).length;
   out.setupChecks = 'Value ' + tick(cheap) + '  Analysts ' + (tUp === null ? '–' : thin ? '? (thin)' : tick(analystsAgree)) +
     '  Estimates ' + (estUp ? '↑' : estDown ? '↓' : '–') + '  Quality ' + tick(roic === null ? null : roic >= 0.15 && dir >= 0.6) +
     '  Trend ' + (trendUp === null ? '–' : trendUp ? '↑' : trendDown ? '↓' : '→') + '  Priced-in growth ' + tick(impl === null ? null : pricedIn) +
+    '  Debt ' + (out.highDebt ? '✗' : out.ndEbitda === null && out.intCover === null ? '–' : '✓') +
     (spec ? '  (speculative: no setup)' : '');
 }
 
@@ -1455,7 +1474,7 @@ var CALC_COLS = [
   ['Revenue growth 1-yr', '0.0%;[Red]-0.0%', 'revYoY'], ['Revenue growth 3-yr CAGR', '0.0%;[Red]-0.0%', 'revCagr3'],
   ['Gross margin', '0.0%;[Red]-0.0%', 'grossMargin'], ['Operating margin', '0.0%;[Red]-0.0%', 'opMargin'],
   ['FCF margin', '0.0%;[Red]-0.0%', 'fcfMargin'], ['ROIC', '0.0%;[Red]-0.0%', 'roic'],
-  ['Net cash (m)', '#,##0;[Red]-#,##0', 'netCashM'], ['EV / sales', '0.0', 'evSales'], ['P/E (TTM)', '0.0', 'pe'],
+  ['Net cash (m)', '#,##0;[Red]-#,##0', 'netCashM'], ['Net debt / EBITDA', '0.0"x"', 'ndEbitda'], ['Interest cover', '0.0"x"', 'intCover'], ['EV / sales', '0.0', 'evSales'], ['P/E (TTM)', '0.0', 'pe'],
   ['Cash runway (months)', '0', 'runway'], ['Dilution 1-yr', '0.0%;[Red]-0.0%', 'dilution'],
   ['Data as of', '@', 'dataDate'], ['Notes', '@', 'notesText'],
   ['Analyst target', '#,##0.00', 'analystTarget'], ['Analyst target upside', '0.0%;[Red]-0.0%', 'F:tupside'],
@@ -1701,7 +1720,8 @@ var HOLDINGS_COLS = [
   ['Model vs analysts', 'Model vs analysts', '+0%;[Red]-0%', 85],
   ['Next earnings', 'Next earnings', '@', 110], ['Last EPS surprise', 'Last EPS surprise', '+0.0%;[Red]-0.0%', 80],
   ['EPS est. change 90d', 'EPS estimate change 90d', '+0.0%;[Red]-0.0%', 80], ['Revisions 30d', 'Analyst revisions 30d', '@', 100],
-  ['Setup', 'Setup', '@', 150], ['Setup checks', 'Setup checks', '@', 420]
+  ['Setup', 'Setup', '@', 150], ['Setup checks', 'Setup checks', '@', 420],
+  ['Net debt / EBITDA', 'Net debt / EBITDA', '0.0"x"', 80], ['Interest cover', 'Interest cover', '0.0"x"', 75]
 ];
 var HOLDINGS_FIRST = 14;
 
@@ -1731,6 +1751,7 @@ var WATCH_COLS = [
   ['Exp. return a year (5 yrs)', 'Exp. 5-yr return (a year)', '0.0%;[Red]-0.0%'], ['Direction', 'Direction', '@'],
   ['Signal', 'Watch signal', '@'], ['Setup', 'Setup', '@'], ['Implied growth', 'Implied growth (reverse DCF)', '0.0%'],
   ['Cash runway (months)', 'Cash runway (months)', '0'], ['Dilution 1-yr', 'Dilution 1-yr', '0.0%;[Red]-0.0%'],
+  ['Net debt / EBITDA', 'Net debt / EBITDA', '0.0"x"'], ['Interest cover', 'Interest cover', '0.0"x"'],
   ['Analyst target', 'Analyst target', '#,##0.00'], ['PEG', 'PEG', '0.00'],
   ['Expectations gap', 'Expectations gap (implied - expected growth)', '+0.0%;[Red]-0.0%'],
   ['Model vs analysts', 'Model vs analysts', '+0%;[Red]-0%'],
@@ -1776,10 +1797,11 @@ var SETUP_HELP = [
   ['Quality pullback', 'ROIC 12%+, analysts raising estimates and seeing 15%+ upside, but the price has fallen 5%+ below its 200-day average. Either cheap, or priced for less growth than delivered. Often the chance to buy a strong performer on a dip.'],
   ['Value, waiting for trend', 'Cheap, but estimates are being cut, or the price is falling without estimates rising. Often early: wait for estimates or the trend to turn.'],
   ['Trend broken', 'A quality grower, not cheap, with the price 5%+ below its 200-day average and estimates no longer rising. For holdings: time to review or trim.'],
+  ['High debt', 'Net debt over 3.5x EBITDA (6x for utilities), EBITDA under 3x interest, or net debt with no operating profit. Blocks the buy-type setups. Banks and insurers are excluded.'],
   ['Cash burner', 'Veto: negative free cash flow and priced over 3x fair value or 15x sales. In a back-test on your 2023-26 trades, almost none of these beat the S&P 500.'],
   ['Thin targets', 'Analyst upside of 30%+ resting on fewer than 5 analysts, or fewer than 10 with the highest target over 3x the lowest. Treat the target with caution.'],
   ['', ''],
-  ['Strength (of 7)', 'One point each: at/below fair value, analysts agree, estimates rising, Direction 75%+, price uptrend, ROIC 15%+, priced-in growth below actual growth.'],
+  ['Strength (of 7)', 'One point each: at/below fair value, analysts agree, estimates rising, Direction 75%+, price uptrend, ROIC 15%+, priced-in growth below actual growth (and debt not high).'],
   ['Not a buy list', 'Setups are a shortlist to research. Loss-making and speculative stocks never qualify (except Thin targets).']
 ];
 function writeSetups_(formulasOnly) {
@@ -1818,7 +1840,7 @@ function writeColourRules_() {
   var colours = { 'Stretched': '#F4C7C3', 'Above fair value': '#FCE8B2', 'Fair': '#E8EAED', 'Cheap': '#B7E1CD',
     'Buy zone': '#B7E1CD', 'Approaching': '#D9EAD3', 'Value trap?': '#FCE8B2', 'Speculative': '#D9D2E9',
     'Value setup': '#B7E1CD', 'Compounder': '#C9DAF8', 'Quality pullback': '#D0E0E3', 'Value, waiting for trend': '#FFF2CC', 'Trend broken': '#F4C7C3',
-    'Thin targets': '#E8EAED', 'Cash burner': '#E6B8AF' };
+    'Thin targets': '#E8EAED', 'Cash burner': '#E6B8AF', 'High debt': '#F9CB9C' };
   var apply = function (sh, a1s) {
     if (!sh) return;
     var ranges = a1s.map(function (a) { return sh.getRange(a); }), rules = [];
