@@ -1292,7 +1292,15 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   } else {
     out.pegEps = eps; out.epsGrowth = g0; out.epsGrowthBasis = 'Trailing EPS, start growth rate';
   }
-  out.expGap = typeof out.implied === 'number' ? out.implied - g0 : null;
+  // Comparable expected growth: the start growth (on the standard fade, as implied growth uses) that gives the
+  // same DCF value as the model's own path. Differs from g0 only when analysts' 2-year forecasts lead the path.
+  out.gComparable = g0;
+  if (lead && fcfBase !== null && fcfBase > 0 && type !== 'Financial') {
+    var target = dcfPerShare_(fcfBase, g0, gT, r, netCash, shares, lead);
+    var eq = solveGrowth_(function (g) { return dcfPerShare_(fcfBase, g, gT, r, netCash, shares); }, target);
+    if (eq.g !== null) out.gComparable = eq.g;
+  } else if (lead) out.gComparable = lead.g;
+  out.expGap = typeof out.implied === 'number' ? out.implied - out.gComparable : null;
   out.modelVsAnalysts = out.fv && out.analystTarget ? out.fv / out.analystTarget - 1 : null;
 
   // Metrics
@@ -1412,7 +1420,7 @@ var CALC_COLS = [
   ['Status', '@', 'F:status'], ['Watch signal', '@', 'F:signal'],
   ['Direction', '@', 'dirText'], ['Direction %', '0%', 'scorePct'], ['Direction change (3 months)', '+0;-0;0', 'scoreChange'],
   ['Signals', '@', 'signalText'], ['Models used', '0', 'usedCount'], ['Models', '@', 'usedNames'],
-  ['Implied growth (reverse DCF)', '0.0%', 'implied'], ['Start growth', '0.0%', 'g0'], ['Growth basis', '@', 'gBasis'],
+  ['Implied growth (reverse DCF)', '0.0%', 'implied'], ['Start growth', '0.0%', 'g0'], ['Expected growth (comparable)', '0.0%', 'gComparable'], ['Growth basis', '@', 'gBasis'],
   ['Discount rate', '0.0%', 'r'],
   ['DCF', '#,##0.00', 'm:DCF'], ['FCF future market cap', '#,##0.00', 'm:FCF future market cap'],
   ['5-yr earnings', '#,##0.00', 'm:5-yr earnings'], ['Fwd EPS x P/E', '#,##0.00', 'm:Fwd EPS x P/E'],
@@ -1849,7 +1857,7 @@ function buildStockView_() {
   var cards = [['Fair value', 'Fair value', '#,##0.00'], ['Upside', 'Upside', '+0%;[Red]-0%'],
     ['Exp. return a year', 'Exp. 5-yr return (a year)', '0.0%;[Red]-0.0%'], ['PEG', 'PEG', '0.00'],
     ['Direction', 'Direction', '@'], ['Implied growth', 'Implied growth (reverse DCF)', '0.0%'],
-    ['Expected growth', 'Start growth', '0.0%'], ['Analyst target', 'Analyst target', '#,##0.00']];
+    ['Expected growth', 'Expected growth (comparable)', '0.0%'], ['Analyst target', 'Analyst target', '#,##0.00']];
   cards.forEach(function (k, i) {
     var col = 3 + 2 * i;
     sh.getRange(5, col, 1, 2).merge();
