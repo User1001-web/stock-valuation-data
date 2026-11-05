@@ -1044,8 +1044,8 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
 
   // Classification
   var sic = Number(raw.SIC) || 0;
-  var cyclicalSic = (sic >= 1000 && sic <= 1499) || (sic >= 2800 && sic <= 2999) || (sic >= 3300 && sic <= 3399) ||
-    (sic >= 3670 && sic <= 3679) || (sic >= 3711 && sic <= 3716) || (sic >= 4400 && sic <= 4499);
+  var cyclicalSic = (sic >= 1000 && sic <= 1499) || (sic >= 2800 && sic <= 2829) || (sic >= 2840 && sic <= 2999) || (sic >= 3300 && sic <= 3399) ||
+    (sic >= 3670 && sic <= 3679) || sic === 3572 || (sic >= 3711 && sic <= 3716) || (sic >= 4400 && sic <= 4499);
   var established = (fy('Revenue', 3) || 0) >= 5e9;
   // Cycle trough: an established cyclical company losing money now but profitable over its last three fiscal years
   // (median net margin 3%+). Valued on typical-cycle margins instead of as a loss-maker.
@@ -1138,13 +1138,25 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   if (mN === null || mN <= 0) { mN = S.defNetMargin; if (ovM === null && type !== 'Financial') out.notes.push('Default net margin used'); }
   mF = Math.min(mF, 0.6); mN = Math.min(mN, 0.6);
 
-  // Possible cyclical peak: an established company (revenue >= 5bn three years ago) in a cyclical industry, revenue up >50% in a year AND net margin
-  // more than double last year's. Peak margins revert to the cycle average. Growth follows the analysts when they
-  // forecast revenue to keep rising; otherwise it starts at the 3-year rate (at most 15%), never zero.
+  // Deep cyclical: an established company in a cyclical industry (chips, memory and storage, metals, chemicals, autos,
+  // shipping, mining) that made a loss or near-zero profit (net margin under 3%) in one of its last four fiscal years.
+  // Steady high-margin growers (no bad year) are not treated as cyclical.
+  // Commodity-style swings show in gross margin too (one-off charges only hit net income): range of 15+ points.
+  var gmFY = fyMargins(function (i) { return fy('GrossProfit', i); });
+  if (out.grossMarginNow === undefined && F('GrossProfit TTM') !== null && rev) gmFY.push(F('GrossProfit TTM') / rev);
+  var gmSwing = gmFY.length >= 3 ? Math.max.apply(null, gmFY) - Math.min.apply(null, gmFY) : 0;
+  var deepCyc = cyclicalSic && established && netFY.some(function (x) { return x < 0.03; }) && gmSwing >= 0.15;
+  out.deepCyclical = deepCyc;
+  // Cyclical peak: a deep cyclical with revenue up 50%+ in a year, earning well above its cycle-average margin
+  // (over 1.5x, and over 15%). Long-run margins are set halfway between today's and the cycle average (this year
+  // and the last four fiscal years, losses included): nobody knows when a boom ends, so neither extreme. The
+  // Stock view's margin grid shows the full range. The boom is not extended: no analyst lead years, growth capped as normal (or the 3-yr rate, max 15%, if analysts
+  // do not forecast growth).
   var lastYear = prevNet.length ? prevNet[0] : null;
   var analystsSeeGrowth = consensus && estRev2 >= (rev || 0) * 0.95;
-  var peak = cyclicalSic && established && (ovG === null || ovr.keepPeak) && ovM === null && yoy !== null && yoy > 0.5 && netMarginNow !== null &&
-    lastYear !== null && netMarginNow > 0 && netMarginNow > 2 * Math.max(lastYear, 0.02);
+  var cycAvgNet = mean_([netMarginNow].concat(netFY).filter(function (x) { return x !== null; }));
+  var peak = deepCyc && ovM === null && yoy !== null && yoy > 0.5 && netMarginNow !== null && cycAvgNet !== null &&
+    netMarginNow > 0.15 && netMarginNow > 1.5 * Math.max(cycAvgNet, 0.02);
   out.cyclicalPeak = peak;
   var fcfBase = fcf, epsBase = eps;
   // One-off charges: TTM net margin below half its typical (median) level while operating cash flow is
@@ -1165,15 +1177,28 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     out.notes.push('Cycle trough: losing money now but typically profitable (median net margin ' + Math.round(tNet * 100) + '%); valued on typical-cycle margins');
   }
   if (peak) {
-    var cycNet = mean_([netMarginNow].concat(prevNet)), cycFcf = mean_([fcfMarginNow, fcfMarginAvg]);
-    mN = Math.max(cycNet, 0.01); mF = Math.max(cycFcf || cycNet, 0.01);
+    var cycFcf = mean_([fcfMarginNow].concat(fcfFY).filter(function (x) { return x !== null; }));
+    var mid = function (now, avg) { return now === null ? avg : (now + avg) / 2; };
+    mN = Math.max(mid(netMarginNow, cycAvgNet), 0.02);
+    mF = Math.max(mid(fcfMarginNow, cycFcf !== null ? cycFcf : cycAvgNet), 0.02);
     fcfBase = rev * mF; epsBase = rev * mN / shares;
-    if (!analystsSeeGrowth && ovG === null && gridG === null) {
-      g0 = clamp_(cagr3 === null ? gT : cagr3, gT, 0.15); lead = null; path = growthPath_(g0, gT); out.g0 = g0;
-      out.gBasis = 'Cyclical peak: 3-yr growth, at most 15%';
+    // Revenue at a peak is inflated by boom prices, so growth on top of it is limited to 15% (analysts' forecasts
+    // of further gains are mostly further price rises).
+    if (ovG === null && gridG === null) {
+      g0 = analystsSeeGrowth ? Math.min(g0, 0.15) : clamp_(cagr3 === null ? gT : cagr3, gT, 0.15);
+      out.gBasis = 'Cyclical peak: growth from peak revenue limited to 15%';
     }
-    out.notes.push('Possible cyclical peak: average-cycle margins used' + (analystsSeeGrowth ? ', analysts\' growth kept' : ', growth from 3-yr rate (max 15%)') + ' (override on Tickers to change)');
+    lead = null; path = growthPath_(g0, gT); out.g0 = g0;
+    out.notes.push('Cyclical peak: margins at ' + Math.round(netMarginNow * 100) + '% vs cycle average ' + Math.round(cycAvgNet * 100) +
+      '%; valued on margins halfway between the two (' + Math.round(mN * 100) + '%). See the margin grid on Stock view');
   }
+  // Margin scenario (sensitivity grid for deep cyclicals): scale long-run margins and the earnings/cash-flow base.
+  var mScale = n_(ovr.marginScale);
+  if (mScale !== null) {
+    mN *= mScale; mF *= mScale; epsBase = epsBase === null ? null : epsBase * mScale;
+    fcfBase = fcfBase === null ? (rev ? rev * mF : null) : fcfBase * mScale;
+  }
+  out.mN = mN;
 
   // Dilution (ignores share-count jumps that look like splits)
   var dil = null;
@@ -1209,7 +1234,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   }
   var useEstEps = consensus && !peak && estEps2 !== null && estEps2 > 0;
   if (useEstEps || (epsBase !== null && epsBase > 0)) {
-    var eps2 = useEstEps ? estEps2 * fx : epsBase * (1 + path[0]) * (1 + path[1]);
+    var eps2 = useEstEps ? estEps2 * fx * (mScale !== null ? mScale : 1) : epsBase * (1 + path[0]) * (1 + path[1]);
     if (useEstEps) out.notes.push('Fwd EPS x P/E uses consensus EPS (analysts often use adjusted EPS)');
     var epsYears = useEstEps ? yearsAhead : 2;
     // Financials: modest multiple (banks/insurers rarely sustain growth multiples); growth from revenue is unreliable for them.
@@ -2043,7 +2068,7 @@ function renderStockView_() {
   var area = sh.getRange(G0, C0, 10, 8);
   area.breakApart().clearContent().setBackground(null).setFontWeight('normal');
   if (!grid) { sh.getRange(G0, C0).setValue('No valuation for this stock.'); return; }
-  var out = [['Start growth ↓  Discount rate →'].concat(grid.rVals.map(function (r) { return r; }))];
+  var out = [[grid.byMargin ? 'Long-run net margin ↓  Discount rate →' : 'Start growth ↓  Discount rate →'].concat(grid.rVals.map(function (r) { return r; }))];
   grid.gVals.forEach(function (g, i) { out.push([g].concat(grid.rows[i])); });
   sh.getRange(G0, C0, out.length, out[0].length).setValues(out);
   sh.getRange(G0, C0 + 1, 1, grid.rVals.length).setNumberFormat('0.0%').setFontWeight('bold').setBackground('#F1EFE8');
@@ -2056,7 +2081,9 @@ function renderStockView_() {
     bg[grid.baseRow][grid.baseCol] = '#CECBF6';
     cells.setBackgrounds(bg);
   }
-  sh.getRange(G0 + 1 + grid.gVals.length, C0, 1, 8).merge().getCell(1, 1).setValue('Shaded green where fair value is above today\'s price, red where below. Purple = current settings.')
+  sh.getRange(G0 + 1 + grid.gVals.length, C0, 1, 8).merge().getCell(1, 1).setValue((grid.byMargin ?
+    'Cyclical stock: rows show profit margins from a quarter to 1.5x the model\'s long-run margin (the risk is the cycle turning). ' : '') +
+    'Green where fair value is above today\'s price, red where below. Purple = current settings.')
     .setFontColor('#888780').setFontSize(9);
 }
 
@@ -2091,8 +2118,12 @@ function sensitivityFor_(t) {
   var base = valueCompany(raw, m, fx, ovr, S, null, today);
   if (!base.fv || base.g0 === undefined || base.r === undefined) return null;
   // Growth: 4 steps down, 2 up. Discount rate: 2 steps down, 4 up. Duplicate rows (growth floor) are dropped.
+  // Deep cyclicals (memory, storage, metals...): rows vary long-run profit margins instead, since the risk is the cycle turning.
   var gVals = [], rVals = [];
-  [-0.20, -0.15, -0.10, -0.05, 0, 0.05, 0.10].forEach(function (d) {
+  var byMargin = !!base.deepCyclical && base.mN > 0;
+  var scales = [0.25, 0.5, 0.75, 1, 1.25, 1.5];
+  if (byMargin) scales.forEach(function (k) { gVals.push(base.mN * k); });
+  else [-0.20, -0.15, -0.10, -0.05, 0, 0.05, 0.10].forEach(function (d) {
     var g = d === 0 ? base.g0 : Math.max(base.g0 + d, S.gFloor);
     if (gVals.every(function (x) { return Math.abs(x - g) > 1e-9; })) gVals.push(g);
   });
@@ -2100,17 +2131,20 @@ function sensitivityFor_(t) {
     var r = d === 0 ? base.r : Math.max(base.r + d, S.gTerm + 0.02);
     if (rVals.every(function (x) { return Math.abs(x - r) > 1e-9; })) rVals.push(r);
   });
-  var rows = gVals.map(function (g) {
+  var rows = gVals.map(function (g, gi) {
     return rVals.map(function (r) {
       var S2 = {}; for (var k in S) S2[k] = S[k];
       S2.rMin = r; S2.rMax = r; S2.req = Math.max(S.req + (r - base.r), S.gTerm + 0.02);
-      var v = valueCompany(raw, m, fx, { type: ovr.type, growth: ovr.growth, margin: ovr.margin, gridGrowth: g }, S2, null, today);
+      var o2 = byMargin ? { type: ovr.type, growth: ovr.growth, margin: ovr.margin, marginScale: scales[gi] }
+        : { type: ovr.type, growth: ovr.growth, margin: ovr.margin, gridGrowth: g };
+      var v = valueCompany(raw, m, fx, o2, S2, null, today);
       // Blend the same models as the base fair value, so scenarios are comparable (no price filter re-selection).
       var vals = (base.used || []).map(function (k) { return v.models[k]; }).filter(function (x) { return x > 0; });
       return vals.length ? median_(vals) : (v.fv ? v.fv : '');
     });
   });
-  return { gVals: gVals, rVals: rVals, rows: rows, baseRow: gVals.indexOf(base.g0), baseCol: rVals.indexOf(base.r), price: m.price || n_(calc.Price) };
+  return { gVals: gVals, rVals: rVals, rows: rows, baseRow: byMargin ? 3 : gVals.indexOf(base.g0), baseCol: rVals.indexOf(base.r),
+    price: m.price || n_(calc.Price), byMargin: byMargin };
 }
 
 /** Menu: show the ticker in the selected row (any tab) on the Stock view. */
