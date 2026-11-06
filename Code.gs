@@ -891,6 +891,8 @@ var SETTINGS = [
   ['Trim if any position above', 0.15, '0%', 'Any holding above this is trimmed back to its target.'],
   ['Minimum order (£)', 250, '£#,##0', 'Smaller orders are skipped.'],
   ['Days between adds', 28, '0', 'Below the 200-day average, positions are built in thirds, at least this many days apart (or sooner on a further 10% fall).'],
+  ['Max new money per week', 0.25, '0%', 'Pace limit: buys in any 7 days stop at this share of the cash available at the start of that week (sale proceeds are added on top). 100% = no limit.'],
+  ['Max new positions per week', 4, '0', 'At most this many first-time buys in any 7 days (adds to existing holdings do not count).'],
   ['Weeks of warnings before selling', 4, '0', 'A warning setup (Value, estimates falling / Trend broken / High debt / Cash burner) first halves the position; if it lasts this many weekly snapshots, the rest is sold.']
 ];
 
@@ -1889,7 +1891,7 @@ function portfolioSettings_() {
   return { cash: g('Cash available (£)') || 0, reserve: g('Cash reserve'), maxBest: g('Max position (best ideas)'),
     maxCyc: g('Max position (cyclical)'), maxSpec: g('Max position (speculative)'), maxInd: g('Max per industry'),
     hardCap: g('Trim if any position above'), minOrder: g('Minimum order (£)'), addDays: g('Days between adds'),
-    warnWeeks: g('Weeks of warnings before selling'), stretch: num0_(m['Stretched if 5-yr expected return below'], 0.06) };
+    warnWeeks: g('Weeks of warnings before selling'), pace: g('Max new money per week'), newPerWeek: g('Max new positions per week'), stretch: num0_(m['Stretched if 5-yr expected return below'], 0.06) };
 }
 function num0_(v, d) { return v === '' || v === undefined || v === null || isNaN(Number(v)) ? d : Number(v); }
 
@@ -1990,13 +1992,22 @@ function planPortfolio_(out, market, S, tv) {
   });
   // Allocate cash to buys, strongest first, within the reserve and industry caps.
   var budget = P.cash + sells - P.reserve * total;
+  // Pace: spread new money over weeks. The weekly allowance is a share of the cash held at the start of the
+  // 7-day window (cash now + what was spent in it), less what was already spent; sale proceeds are added on top.
+  var wk = log.weekBuys(), paceNote = '';
+  if (P.pace !== null && P.pace < 1) {
+    var allowance = Math.max(0, P.pace * (P.cash + wk.gbp) - wk.gbp) + sells;
+    if (allowance < budget) { budget = allowance; paceNote = 'weekly pace limit'; }
+  }
+  var newLeft = P.newPerWeek === null ? 99 : Math.max(0, P.newPerWeek - wk.newCount);
   out.filter(function (v) { return v.pendingW > 0; }).sort(function (a, b) { return b.priority - a.priority; }).forEach(function (v) {
     var wantW = v.pendingW, room = P.maxInd - (byInd[v.indKey] || 0);
+    if (v.valueNow === 0 && newLeft <= 0) { v.action = 'Wait'; v.actionWhy = 'Qualifies; new-position limit for this week reached'; return; }
     if (room <= 0) { v.action = 'Wait'; v.actionWhy = 'Industry at its ' + Math.round(P.maxInd * 100) + '% cap'; return; }
     var gbp = Math.min(wantW, room) * total;
     if (gbp > budget) gbp = budget;
-    if (gbp < P.minOrder) { v.action = v.valueNow > 0 ? 'Hold' : 'Wait'; v.actionWhy = budget < P.minOrder ? 'Qualifies, but no cash left after reserve' : 'Order below minimum'; return; }
-    budget -= gbp; byInd[v.indKey] = (byInd[v.indKey] || 0) + gbp / total;
+    if (gbp < P.minOrder) { v.action = v.valueNow > 0 ? 'Hold' : 'Wait'; v.actionWhy = budget < P.minOrder ? (paceNote ? 'Qualifies; this week\'s pace limit is used up' : 'Qualifies, but no cash left after reserve') : 'Order below minimum'; return; }
+    budget -= gbp; if (v.valueNow === 0) newLeft--; byInd[v.indKey] = (byInd[v.indKey] || 0) + gbp / total;
     v.orderGBP = gbp;
     orders.push({ action: v.action, v: v, gbp: gbp, why: v.actionWhy });
   });
@@ -2031,6 +2042,11 @@ function orderLogIndex_() {
       var b = null;
       rows.forEach(function (r) { if (String(r[2]).toUpperCase() === t && (r[1] === 'Buy' || r[1] === 'Add')) { var d = days(r[0]); if (!b || d < b.days) b = { days: d, price: Number(r[5]) || null }; } });
       return b;
+    },
+    weekBuys: function () {
+      var gbp = 0, newT = {};
+      rows.forEach(function (r) { if ((r[1] === 'Buy' || r[1] === 'Add') && days(r[0]) < 7) { gbp += Number(r[3]) || 0; if (r[1] === 'Buy') newT[String(r[2]).toUpperCase()] = 1; } });
+      return { gbp: gbp, newCount: Object.keys(newT).length };
     },
     lastTrimAfter: function (t, weeks) {
       var limit = Math.max(weeks, 1) * 7 + 3;
@@ -2118,7 +2134,7 @@ var RULES_TEXT = [
   ['3. Confirm', 'Forecasts must not be falling (built into the setups) and the price must need no more growth than expected (Expectations gap 2% or lower).'],
   ['4. Size', 'Target weight = best-ideas cap x (40% + 60% x conviction). Conviction blends Strength, expected return, the expectations cushion and Direction. Cyclicals use the lower cyclical cap.'],
   ['5. Buy', 'Above the 200-day average: buy the full target. Below it: buy a third now, the next third after the set number of days or on a further 10% fall.'],
-  ['6. Cash', 'Money goes to qualifying stocks, strongest first, keeping the cash reserve and the per-industry cap. Anything left stays in cash until the next opportunity.'],
+  ['6. Cash', 'Money goes to qualifying stocks, strongest first, keeping the cash reserve and the per-industry cap. A pace limit spreads it over weeks: at most the set share of cash, and the set number of new positions, in any 7 days. Anything left stays in cash until the next opportunity.'],
   ['7. Warnings', 'Value, estimates falling / Trend broken / High debt / Cash burner on a holding: halve it, then sell the rest if the warning lasts the set number of weeks.'],
   ['8. Trims', 'Any holding above the hard cap is trimmed to target. Stretched holdings (expected return below the Stretched level) with no buy setup and Direction under 75% are trimmed by a third: winners whose business is still improving strongly are left to run. Speculative holdings above 1.5x the speculative cap are trimmed to the cap.'],
   ['9. Hold', 'Everything else is held. Unqualified holdings are never added to.'],
