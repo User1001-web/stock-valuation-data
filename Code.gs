@@ -885,6 +885,7 @@ var SETTINGS = [
   ['Cash available (£)', 0, '£#,##0', 'PORTFOLIO RULES. Uninvested cash in your account. Updated automatically when you tick an order Done on the Orders tab; correct it here after trades.'],
   ['Cash reserve', 0.05, '0%', 'Share of the portfolio always kept in cash.'],
   ['Max position (best ideas)', 0.10, '0.0%', 'Target size for the strongest opportunities. Weaker qualifying stocks get down to 40% of this.'],
+  ['Min position', 0.04, '0.0%', 'Smallest full position worth holding. When more stocks qualify than the portfolio has room for at this size, only the strongest are bought; the rest wait.'],
   ['Max position (cyclical)', 0.06, '0.0%', 'Memory, storage, metals and other boom-and-bust stocks.'],
   ['Max position (speculative)', 0.02, '0.0%', 'Loss-making, thinly covered or unqualified stocks. Holdings above 1.5x this are trimmed back to it.'],
   ['Max per industry', 0.35, '0%', 'New buys stop once an industry reaches this share of the portfolio.'],
@@ -1890,7 +1891,7 @@ function portfolioSettings_() {
   };
   return { cash: g('Cash available (£)') || 0, reserve: g('Cash reserve'), maxBest: g('Max position (best ideas)'),
     maxCyc: g('Max position (cyclical)'), maxSpec: g('Max position (speculative)'), maxInd: g('Max per industry'),
-    hardCap: g('Trim if any position above'), minOrder: g('Minimum order (£)'), addDays: g('Days between adds'),
+    hardCap: g('Trim if any position above'), minPos: g('Min position'), minOrder: g('Minimum order (£)'), addDays: g('Days between adds'),
     warnWeeks: g('Weeks of warnings before selling'), pace: g('Max new money per week'), newPerWeek: g('Max new positions per week'), stretch: num0_(m['Stretched if 5-yr expected return below'], 0.06) };
 }
 function num0_(v, d) { return v === '' || v === undefined || v === null || isNaN(Number(v)) ? d : Number(v); }
@@ -1929,6 +1930,32 @@ function planPortfolio_(out, market, S, tv) {
     var ind = v.industry || v.sector || 'Other'; byInd[ind] = (byInd[ind] || 0) + v.weightNow; v.indKey = ind;
   });
   var clip = function (x) { return Math.max(0, Math.min(1, x)); };
+  // Pass 1: which stocks qualify, and their stand-alone targets.
+  var isBuyType = function (v) { return v.setup === 'Value setup' || v.setup === 'Compounder' || v.setup === 'Quality pullback'; };
+  var sumQ = 0, heldOther = 0;
+  out.forEach(function (v) {
+    var sAdj = (v.setupScore || 0) + (v.trendUp === true ? 0 : 1);
+    var gp = typeof v.expGap === 'number' ? v.expGap : null;
+    v._q = isBuyType(v) && (v.scorePct || 0) >= 0.75 && sAdj >= 5 && (gp === null || gp <= 0.02);
+    if (v._q) {
+      var cv = (clip((sAdj - 5) / 2) + clip(((v.expRet || 0.1) - 0.10) / 0.15) + clip(-(gp || 0) / 0.3) + clip(((v.scorePct || 0) - 0.75) / 0.25)) / 4;
+      v._t = (v.deepCyclical ? P.maxCyc : P.maxBest) * (0.4 + 0.6 * cv);
+      sumQ += v._t;
+    } else if (v.valueNow > 0) heldOther += v.weightNow;
+  });
+  // Targets must fit in the portfolio: what is left after the cash reserve and the holdings that do not
+  // qualify is shared among qualifying stocks in proportion to conviction (best ideas still get the most).
+  var room = Math.max(0, 1 - P.reserve - heldOther);
+  // Keep only as many qualifiers (strongest first) as fit at the minimum position size or more.
+  var Q = out.filter(function (v) { return v._q; }).sort(function (a, b) { return b._t - a._t; });
+  var scale = 1;
+  while (Q.length) {
+    var sum = Q.reduce(function (a, v) { return a + v._t; }, 0);
+    scale = sum > room ? room / sum : 1;
+    if (Q.length === 1 || Q[Q.length - 1]._t * scale >= P.minPos) break;
+    var drop = Q.pop(); drop._q = false; drop._ranked = Q.length;
+  }
+  if (!Q.length) scale = 0;
   var orders = [], sells = 0;
   out.forEach(function (v) {
     v.action = ''; v.targetW = ''; v.orderGBP = ''; v.actionWhy = '';
@@ -1936,13 +1963,11 @@ function planPortfolio_(out, market, S, tv) {
     var buyType = v.setup === 'Value setup' || v.setup === 'Compounder' || v.setup === 'Quality pullback';
     var strengthAdj = (v.setupScore || 0) + (v.trendUp === true ? 0 : 1);
     var gap = typeof v.expGap === 'number' ? v.expGap : null;
-    var qualifies = buyType && (v.scorePct || 0) >= 0.75 && strengthAdj >= 5 && (gap === null || gap <= 0.02);
+    var qualifies = v._q;
     var warned = !!WARN_SETUPS[v.setup];
     var why = [];
     if (qualifies) {
-      var conv = (clip((strengthAdj - 5) / 2) + clip(((v.expRet || 0.1) - 0.10) / 0.15) + clip(-(gap || 0) / 0.3) + clip(((v.scorePct || 0) - 0.75) / 0.25)) / 4;
-      var cap = v.deepCyclical ? P.maxCyc : P.maxBest;
-      v.targetW = cap * (0.4 + 0.6 * conv);
+      v.targetW = v._t * scale;
       why.push(v.setup + ', strength ' + v.setupScore + '/7, direction ' + Math.round((v.scorePct || 0) * 100) + '%');
     } else if (held) {
       v.targetW = v.speculative || v.thinTargets || v.type === 'Pre-profit' ? Math.min(v.weightNow, P.maxSpec) : v.weightNow;
@@ -1987,6 +2012,7 @@ function planPortfolio_(out, market, S, tv) {
       v.actionWhy = why.concat(v.trendUp === true ? ['above 200-day average: full position'] : ['below 200-day average: building in thirds']).join('; ');
       return;
     }
+    if (v._ranked !== undefined) { v.action = held ? 'Hold' : 'Wait'; v.actionWhy = 'Qualifies, but ranks below the ' + v._ranked + ' strongest that fit the portfolio at ' + Math.round(P.minPos * 100) + '%+ each'; return; }
     if (held && !v.action) { v.action = 'Hold'; v.actionWhy = qualifies ? 'At target' : (v.setup ? v.setup + ': no adds' : 'Does not qualify for adds'); }
     else if (!held && buyType && !qualifies) { v.action = 'Watch'; v.actionWhy = 'Setup but not all rules: ' + [(v.scorePct || 0) < 0.75 ? 'direction under 75%' : '', strengthAdj < 5 ? 'strength under 5' : '', gap !== null && gap > 0.02 ? 'priced for more growth than expected' : ''].filter(String).join(', '); }
   });
@@ -2012,7 +2038,7 @@ function planPortfolio_(out, market, S, tv) {
     orders.push({ action: v.action, v: v, gbp: gbp, why: v.actionWhy });
   });
   orders.sort(function (a, b) { var o = { Sell: 0, Trim: 1, Buy: 2, Add: 3 }; return o[a.action] - o[b.action] || Math.abs(b.gbp) - Math.abs(a.gbp); });
-  orders.meta = { total: total, cash: P.cash, invested: invested, reserve: P.reserve * total, sells: sells,
+  orders.meta = { scale: scale, qualifiers: out.filter(function (v) { return v._q; }).length, total: total, cash: P.cash, invested: invested, reserve: P.reserve * total, sells: sells,
     buys: orders.filter(function (o) { return o.gbp > 0; }).reduce(function (a, o) { return a + o.gbp; }, 0) };
   return orders;
 }
@@ -2077,12 +2103,15 @@ function writeOrders_(orders) {
   var sc = ORDER_COLS.length + 2;
   var summary = [['Summary', ''], ['Portfolio value (£)', M.total || ''], ['Invested (£)', M.invested || ''], ['Cash available (£)', M.cash || 0],
     ['Cash reserve kept (£)', M.reserve || ''], ['Sells and trims (£)', M.sells || 0], ['Buys and adds (£)', M.buys || 0],
-    ['Cash after orders (£)', (M.cash || 0) + (M.sells || 0) - (M.buys || 0)], ['Updated', new Date()], ['', ''],
-    ['How to use', 'Place each order with your broker, then tick Done. The trade is logged, Holdings and Cash available are updated, and the list is recalculated. Correct shares or cash afterwards if the fill differed. Rules and limits: Rules tab and Assumptions.']];
+    ['Cash after orders (£)', (M.cash || 0) + (M.sells || 0) - (M.buys || 0)], ['Updated', new Date()],
+    ['Stocks in the plan', M.qualifiers || 0],
+    ['Targets scaled to fit', M.scale !== undefined && M.scale < 1 ? Math.round(M.scale * 100) + '% of stand-alone size' : 'No'], ['', ''],
+    ['How to use', 'Place each order, then tick Done.'], ['', 'Holdings and Cash available update automatically.'],
+    ['', 'Correct shares or cash if the fill differed.'], ['', 'Rules and limits: Rules tab and Assumptions.']];
   sh.getRange(1, sc, summary.length, 2).setValues(summary);
   sh.getRange(2, sc + 1, 7, 1).setNumberFormat('£#,##0');
   sh.getRange(1, sc, 1, 2).setFontWeight('bold');
-  sh.getRange(summary.length, sc + 1).setWrap(true);
+  sh.getRange(1, sc, summary.length, 2).setWrap(false);
   sh.setColumnWidth(sc, 170); sh.setColumnWidth(sc + 1, 320);
   [60, 60, 70, 180, 90, 90, 90, 70, 80, 90, 140, 70, 420].forEach(function (w, i) { sh.setColumnWidth(i + 1, w); });
   sh.setFrozenRows(1);
@@ -2132,7 +2161,7 @@ var RULES_TEXT = [
   ['1. Gate', 'Only stocks whose business is improving qualify: Direction 75% or higher.'],
   ['2. Rank', 'Buy-type setup (Value setup, Compounder, Quality pullback) with Strength 5+ out of 7. A missing Trend point is not held against it.'],
   ['3. Confirm', 'Forecasts must not be falling (built into the setups) and the price must need no more growth than expected (Expectations gap 2% or lower).'],
-  ['4. Size', 'Target weight = best-ideas cap x (40% + 60% x conviction). Conviction blends Strength, expected return, the expectations cushion and Direction. Cyclicals use the lower cyclical cap.'],
+  ['4. Size', 'Stand-alone target = best-ideas cap x (40% + 60% x conviction). Conviction blends Strength, expected return, the expectations cushion and Direction. Cyclicals use the lower cyclical cap. When many stocks qualify, targets are scaled down together so they fit in the portfolio (after the cash reserve and the holdings that do not qualify); if that would make positions smaller than the minimum position, only the strongest qualifiers are kept.'],
   ['5. Buy', 'Above the 200-day average: buy the full target. Below it: buy a third now, the next third after the set number of days or on a further 10% fall.'],
   ['6. Cash', 'Money goes to qualifying stocks, strongest first, keeping the cash reserve and the per-industry cap. A pace limit spreads it over weeks: at most the set share of cash, and the set number of new positions, in any 7 days. Anything left stays in cash until the next opportunity.'],
   ['7. Warnings', 'Value, estimates falling / Trend broken / High debt / Cash burner on a holding: halve it, then sell the rest if the warning lasts the set number of weeks.'],
