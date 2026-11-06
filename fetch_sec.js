@@ -172,9 +172,16 @@ async function main() {
             ' (revenue ' + (d * 100 >= 0 ? '+' : '') + (d * 100).toFixed(1) + '%' + (niOK ? '' : ', net income off') + ')' };
         };
         const match = (y._trailing || []).find(r => Math.abs(Date.parse(r.iso) - Date.parse(secEnd)) <= 20 * 864e5 && ukVal(r, 'Revenue') !== '');
-        const sameFY = y['Latest FY end'] && row['Latest FY end'] && Math.abs(Date.parse(y['Latest FY end']) - Date.parse(row['Latest FY end'])) <= 20 * 864e5;
+        // Fiscal years line up when Yahoo's year k back ends within 20 days of the SEC's latest fiscal year.
+        let fyK = null;
+        if (y['Latest FY end'] && row['Latest FY end']) {
+          const gap = (Date.parse(y['Latest FY end']) - Date.parse(row['Latest FY end'])) / 864e5;
+          const k = Math.round(gap / 365.25);
+          if (k >= 0 && k <= 2 && Math.abs(gap - k * 365.25) <= 20) fyK = k;
+        }
+        const yfy = f => y[f + ' FY' + (fyK === 0 ? '0' : '-' + fyK)];
         const res = match ? cmp(ukVal(match, 'Revenue'), ukVal(match, 'NetIncome'), Number(row['Revenue TTM']), row['NetIncome TTM'] === '' ? '' : Number(row['NetIncome TTM']), '12-month figures')
-          : sameFY ? cmp(y['Revenue FY0'], y['NetIncome FY0'], Number(row['Revenue FY0']), row['NetIncome FY0'] === '' ? '' : Number(row['NetIncome FY0']), 'fiscal year ' + String(row['Latest FY end']).slice(0, 4))
+          : fyK !== null ? cmp(yfy('Revenue'), yfy('NetIncome'), Number(row['Revenue FY0']), row['NetIncome FY0'] === '' ? '' : Number(row['NetIncome FY0']), 'fiscal year ' + String(row['Latest FY end']).slice(0, 4))
           : { ok: false, why: 'no overlapping period to check against the SEC' };
         const verified = res.ok, check = res.why;
         const annualFiler = ageDays > 150;
