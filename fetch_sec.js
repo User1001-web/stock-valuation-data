@@ -58,6 +58,7 @@ const EMAIL = (process.env.SEC_EMAIL || '').trim();
 const LIST_URL = (process.env.TICKERS_CSV_URL || '').trim();
 const OUT_DIR = process.env.OUT_DIR || path.join(__dirname, 'data');
 const PAUSE_MS = 150;                       // SEC allows 10 requests/second
+const yahooBridge = [], yahooRejected = [];   // tickers bridged with newer Yahoo results, and those rejected by the check
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function secJson(url) {
@@ -149,18 +150,43 @@ async function main() {
         }
       }
     }
-    // SEC figures over 150 days old (annual-only foreign filers, combined filings missing from the feed):
-    // take the latest 12 months from Yahoo when it is newer. History and balance sheet stay from the SEC.
-    if (row.CIK && /^\d+$/.test(String(row.CIK)) && row['Latest period end'] && (Date.now() - Date.parse(row['Latest period end'])) / 864e5 > 150) {
+    // Newer results on Yahoo than in the SEC data: either a company has reported a quarter but not yet filed it
+    // with the SEC (checked from 105 days after the SEC period end), or an annual-only foreign filer (150+ days).
+    // Yahoo's latest 12 months are used for income and cash-flow figures, EPS and share counts; balance sheet and
+    // history stay from the SEC. For the recent-quarter case the Yahoo figures must first match the SEC's own
+    // 12-month figures for the same period (revenue within 3%, net income within 10%), or they are ignored.
+    // Once the SEC filing arrives, its period end catches up and this no longer applies (back to SEC data).
+    const secEnd = row['Latest period end'];
+    const ageDays = secEnd ? (Date.now() - Date.parse(secEnd)) / 864e5 : 0;
+    if (row.CIK && /^\d+$/.test(String(row.CIK)) && secEnd && ageDays > 105) {
       const y = await yahooRow(t.ticker, t.ticker.replace(/\./g, '-'), 'YAHOO');
-      if (y['Latest period end'] && Date.parse(y['Latest period end']) > Date.parse(row['Latest period end']) + 60 * 864e5 &&
+      if (y['Latest period end'] && Date.parse(y['Latest period end']) > Date.parse(secEnd) + 60 * 864e5 &&
           (!y.Currency || !row.Currency || y.Currency === row.Currency)) {
-        ['Revenue', 'GrossProfit', 'OperatingIncome', 'NetIncome', 'PretaxIncome', 'IncomeTax', 'InterestExpense', 'OCF', 'Capex', 'SBC', 'DA', 'DividendsPaid', 'Buybacks']
-          .forEach(fld => { [' TTM', ' TTM 1y ago'].forEach(sfx => { if (y[fld + sfx] !== '' && y[fld + sfx] !== undefined) row[fld + sfx] = y[fld + sfx]; }); });
-        ['EPS TTM', 'EPS TTM 1y ago', 'Diluted shares latest', 'Diluted shares 1y ago'].forEach(k => { if (y[k] !== '' && y[k] !== undefined) row[k] = y[k]; });
-        row.Notes = (row.Notes ? row.Notes.replace(/; ?Latest financials are over 200 days old/, '') + '; ' : '') +
-          'Latest 12 months from Yahoo (to ' + y['Latest period end'] + '), newer than SEC data (' + row['Latest period end'] + ')';
-        row['Latest period end'] = y['Latest period end'];
+        const match = (y._trailing || []).find(r => Math.abs(Date.parse(r.iso) - Date.parse(secEnd)) <= 20 * 864e5);
+        let verified = false, check = 'no overlapping period to check against the SEC';
+        if (match) {
+          const yr = ukVal(match, 'Revenue'), yn = ukVal(match, 'NetIncome');
+          const sr = Number(row['Revenue TTM']), sn = Number(row['NetIncome TTM']);
+          const revDiff = yr !== '' && sr ? yr / sr - 1 : null;
+          const niOK = yn === '' || row['NetIncome TTM'] === '' ? true : Math.abs(yn - sn) <= Math.max(0.1 * Math.abs(sn), 0.01 * Math.abs(sr));
+          verified = revDiff !== null && Math.abs(revDiff) <= 0.03 && niOK;
+          check = verified ? 'matched SEC figures for the prior period' :
+            'did not match SEC figures for the prior period (revenue ' + (revDiff === null ? 'n/a' : (revDiff * 100).toFixed(1) + '%') + (niOK ? '' : ', net income') + ')';
+        }
+        const annualFiler = ageDays > 150;
+        if (verified || (annualFiler && !match)) {
+          ['Revenue', 'GrossProfit', 'OperatingIncome', 'NetIncome', 'PretaxIncome', 'IncomeTax', 'InterestExpense', 'OCF', 'Capex', 'SBC', 'DA', 'DividendsPaid', 'Buybacks']
+            .forEach(fld => { [' TTM', ' TTM 1y ago'].forEach(sfx => { if (y[fld + sfx] !== '' && y[fld + sfx] !== undefined) row[fld + sfx] = y[fld + sfx]; }); });
+          ['EPS TTM', 'EPS TTM 1y ago', 'Diluted shares latest', 'Diluted shares 1y ago'].forEach(k => { if (y[k] !== '' && y[k] !== undefined) row[k] = y[k]; });
+          row.Notes = (row.Notes ? row.Notes.replace(/; ?Latest financials are over 200 days old/, '') + '; ' : '') +
+            'Latest 12 months from Yahoo (to ' + y['Latest period end'] + '; ' + (match ? check : 'annual SEC filer') +
+            '); SEC data (to ' + secEnd + ') used again once the filing arrives';
+          row['Latest period end'] = y['Latest period end'];
+          yahooBridge.push(t.ticker + (match ? '' : ' (annual filer)'));
+        } else {
+          row.Notes = (row.Notes ? row.Notes + '; ' : '') + 'Newer Yahoo figures (to ' + y['Latest period end'] + ') not used: ' + check;
+          yahooRejected.push(t.ticker + ': ' + check);
+        }
       }
     }
     const staleDays = row['Latest period end'] ? (Date.now() - Date.parse(row['Latest period end'])) / 864e5 : 0;
@@ -194,6 +220,8 @@ async function main() {
   if (rates.length > 1) fs.writeFileSync(path.join(OUT_DIR, 'rates.csv'), rates.join('\n') + '\n');
   const ok = rows.filter(r => r.Status === 'OK').length;
   console.log(`\nWrote ${rows.length} rows (${ok} OK) to raw_data.csv`);
+  console.log(`Yahoo bridge used (${yahooBridge.length}): ${yahooBridge.join(', ')}`);
+  console.log(`Yahoo bridge rejected (${yahooRejected.length}):\n  ${yahooRejected.join('\n  ')}`);
 }
 
 // Yahoo symbol suffix per exchange code typed in the Tickers tab (column C).
@@ -239,6 +267,7 @@ async function yahooRow(ticker, sym, idTag) {
     await sleep(300);
     const trailing = (await yf.fundamentalsTimeSeries(sym, { period1: '2023-01-01', type: 'trailing', module: 'all' }, { validateResult: false }))
       .map(r => Object.assign({}, r, { iso: isoOf(r.date) })).sort((a, b) => (a.iso < b.iso ? 1 : -1));
+    Object.defineProperty(row, '_trailing', { value: trailing, enumerable: false });
     await sleep(300);
     if (!annual.length) return { Ticker: ticker, Status: idTag === 'LSE' ? 'No UK financial data on Yahoo Finance' : 'No SEC or Yahoo financial data' };
     row['SEC name'] = (qs.price && qs.price.longName) || '';
