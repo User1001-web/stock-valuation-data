@@ -162,27 +162,31 @@ async function main() {
       const y = await yahooRow(t.ticker, t.ticker.replace(/\./g, '-'), 'YAHOO');
       if (y['Latest period end'] && Date.parse(y['Latest period end']) > Date.parse(secEnd) + 60 * 864e5 &&
           (!y.Currency || !row.Currency || y.Currency === row.Currency)) {
+        // Consistency check: Yahoo and the SEC must agree on an overlapping period (revenue within 3%, net income
+        // within 10%). Uses the 12 months to the SEC's latest period when Yahoo has it, else the last full fiscal year.
+        const cmp = (yr, yn, sr, sn, label) => {
+          if (yr === '' || !sr) return { ok: false, why: 'no overlapping ' + label + ' to check' };
+          const d = yr / sr - 1;
+          const niOK = yn === '' || sn === '' || isNaN(sn) ? true : Math.abs(yn - sn) <= Math.max(0.1 * Math.abs(sn), 0.01 * Math.abs(sr));
+          return { ok: Math.abs(d) <= 0.03 && niOK, why: (Math.abs(d) <= 0.03 && niOK ? 'matched SEC ' : 'did not match SEC ') + label +
+            ' (revenue ' + (d * 100 >= 0 ? '+' : '') + (d * 100).toFixed(1) + '%' + (niOK ? '' : ', net income off') + ')' };
+        };
         const match = (y._trailing || []).find(r => Math.abs(Date.parse(r.iso) - Date.parse(secEnd)) <= 20 * 864e5 && ukVal(r, 'Revenue') !== '');
-        let verified = false, check = 'no overlapping period to check against the SEC';
-        if (match) {
-          const yr = ukVal(match, 'Revenue'), yn = ukVal(match, 'NetIncome');
-          const sr = Number(row['Revenue TTM']), sn = Number(row['NetIncome TTM']);
-          const revDiff = yr !== '' && sr ? yr / sr - 1 : null;
-          const niOK = yn === '' || row['NetIncome TTM'] === '' ? true : Math.abs(yn - sn) <= Math.max(0.1 * Math.abs(sn), 0.01 * Math.abs(sr));
-          verified = revDiff !== null && Math.abs(revDiff) <= 0.03 && niOK;
-          check = verified ? 'matched SEC figures for the prior period' :
-            'did not match SEC figures for the prior period (revenue ' + (revDiff === null ? 'n/a' : (revDiff * 100).toFixed(1) + '%') + (niOK ? '' : ', net income') + ')';
-        }
+        const sameFY = y['Latest FY end'] && row['Latest FY end'] && Math.abs(Date.parse(y['Latest FY end']) - Date.parse(row['Latest FY end'])) <= 20 * 864e5;
+        const res = match ? cmp(ukVal(match, 'Revenue'), ukVal(match, 'NetIncome'), Number(row['Revenue TTM']), row['NetIncome TTM'] === '' ? '' : Number(row['NetIncome TTM']), '12-month figures')
+          : sameFY ? cmp(y['Revenue FY0'], y['NetIncome FY0'], Number(row['Revenue FY0']), row['NetIncome FY0'] === '' ? '' : Number(row['NetIncome FY0']), 'fiscal year ' + String(row['Latest FY end']).slice(0, 4))
+          : { ok: false, why: 'no overlapping period to check against the SEC' };
+        const verified = res.ok, check = res.why;
         const annualFiler = ageDays > 150;
-        if (verified || (annualFiler && !match)) {
+        if (verified) {
           ['Revenue', 'GrossProfit', 'OperatingIncome', 'NetIncome', 'PretaxIncome', 'IncomeTax', 'InterestExpense', 'OCF', 'Capex', 'SBC', 'DA', 'DividendsPaid', 'Buybacks']
             .forEach(fld => { [' TTM', ' TTM 1y ago'].forEach(sfx => { if (y[fld + sfx] !== '' && y[fld + sfx] !== undefined) row[fld + sfx] = y[fld + sfx]; }); });
           ['EPS TTM', 'EPS TTM 1y ago', 'Diluted shares latest', 'Diluted shares 1y ago'].forEach(k => { if (y[k] !== '' && y[k] !== undefined) row[k] = y[k]; });
           row.Notes = (row.Notes ? row.Notes.replace(/; ?Latest financials are over 200 days old/, '') + '; ' : '') +
-            'Latest 12 months from Yahoo (to ' + y['Latest period end'] + '; ' + (match ? check : 'annual SEC filer') +
+            'Latest 12 months from Yahoo (to ' + y['Latest period end'] + '; ' + check +
             '); SEC data (to ' + secEnd + ') used again once the filing arrives';
           row['Latest period end'] = y['Latest period end'];
-          yahooBridge.push(t.ticker + (match ? '' : ' (annual filer)'));
+          yahooBridge.push(t.ticker + (annualFiler ? ' (annual/half-year filer)' : '') + ' ' + check.replace(/^matched SEC /, ''));
         } else {
           row.Notes = (row.Notes ? row.Notes + '; ' : '') + 'Newer Yahoo figures (to ' + y['Latest period end'] + ') not used: ' + check;
           yahooRejected.push(t.ticker + ': ' + check);
