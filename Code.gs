@@ -152,7 +152,7 @@ function onOpen() {
     .addItem('First-time setup', 'setup')
     .addSeparator()
     .addItem('Load latest data from GitHub now', 'refreshFundamentals')
-    .addItem('Recalculate valuations', 'recalcValuations')
+    .addItem('Recalculate valuations and orders', 'recalcValuations')
     .addItem('Rebuild Market tab', 'rebuildMarket')
     .addItem('Repair formulas (after sorting)', 'repairFormulas')
     .addSeparator()
@@ -167,6 +167,9 @@ function onEdit(e) {
     var name = e.range.getSheet().getName();
     if ((name === SHEET.TICKERS || name === SHEET.HOLDINGS) && e.range.getColumn() <= 2) { syncMarket_(); recalcValuations(); }
     if (name === SHEET.ASSUME || (name === SHEET.TICKERS && e.range.getColumn() >= 5 && e.range.getColumn() <= 7)) recalcValuations();
+    if (name === ORDERS.NAME && e.range.getColumn() === 1 && e.range.getRow() > 1 && e.range.getValue() === true) {
+      executeOrder_(e.range.getRow()); recalcValuations(); return;
+    }
     if (name === SV.NAME) {
       var a1 = e.range.getA1Notation();
       if (a1 === SV.TICKER) renderStockView_();
@@ -203,6 +206,8 @@ function setup() {
   writeHoldingsValuation_();
   writeWatchlist_();
   writeSetups_();
+  writeRulesTab_();
+  recalcValuations();
   writeColourRules_();
   buildStockView_();
 
@@ -876,7 +881,17 @@ var SETTINGS = [
   ['Default long-run FCF margin (pre-profit)', 0.15, '0%', 'Used when a company has no positive margin history. Per-stock override on Tickers.'],
   ['Default long-run net margin (pre-profit)', 0.12, '0%', ''],
   ['Stretched if 5-yr expected return below', 0.06, '0%', ''],
-  ['Max data age (months)', 15, '0', 'Older SEC data is not valued.']
+  ['Max data age (months)', 15, '0', 'Older SEC data is not valued.'],
+  ['Cash available (£)', 0, '£#,##0', 'PORTFOLIO RULES. Uninvested cash in your account. Updated automatically when you tick an order Done on the Orders tab; correct it here after trades.'],
+  ['Cash reserve', 0.05, '0%', 'Share of the portfolio always kept in cash.'],
+  ['Max position (best ideas)', 0.10, '0.0%', 'Target size for the strongest opportunities. Weaker qualifying stocks get down to 40% of this.'],
+  ['Max position (cyclical)', 0.06, '0.0%', 'Memory, storage, metals and other boom-and-bust stocks.'],
+  ['Max position (speculative)', 0.02, '0.0%', 'Loss-making, thinly covered or unqualified stocks. Holdings above 1.5x this are trimmed back to it.'],
+  ['Max per industry', 0.35, '0%', 'New buys stop once an industry reaches this share of the portfolio.'],
+  ['Trim if any position above', 0.15, '0%', 'Any holding above this is trimmed back to its target.'],
+  ['Minimum order (£)', 250, '£#,##0', 'Smaller orders are skipped.'],
+  ['Days between adds', 28, '0', 'Below the 200-day average, positions are built in thirds, at least this many days apart (or sooner on a further 10% fall).'],
+  ['Weeks of warnings before selling', 4, '0', 'A warning setup (Value, estimates falling / Trend broken / High debt / Cash burner) first halves the position; if it lasts this many weekly snapshots, the rest is sold.']
 ];
 
 function settingsFromMap_(m) {
@@ -1437,6 +1452,7 @@ function setupFor_(out, raw, price, eps, type, S) {
   else if (!spec && !cheap && roic !== null && roic >= 0.12 && growth >= 0.1 && !estUp && (trendDown || (v2 !== null && v2 < -0.15))) s = 'Trend broken';
   else if (tUp !== null && tUp >= 0.3 && thin) s = 'Thin targets';
   out.setup = s; out.setupRank = s ? SETUP_RANK[s] : '';
+  out.trendUp = trendUp; out.expRet = exp; out.speculative = spec; out.thinTargets = thin;
   var tick = function (b) { return b === null ? '–' : b ? '✓' : '✗'; };
   out.setupScore = [cheap, analystsAgree, estUp, dir >= 0.75, trendUp === true, roic !== null && roic >= 0.15, pricedIn && !out.highDebt]
     .filter(function (b) { return b; }).length;
@@ -1488,6 +1504,8 @@ var CALC_COLS = [
   ['EPS estimate change 30d', '+0.0%;[Red]-0.0%', 'estChg30'], ['EPS estimate change 90d', '+0.0%;[Red]-0.0%', 'estChg90'],
   ['Analyst revisions 30d', '@', 'revisionsText'],
   ['Setup', '@', 'setup'], ['Setup strength (of 7)', '0', 'setupScore'], ['Setup checks', '@', 'setupChecks'], ['Setup rank', '0', 'setupRank'],
+  ['Action', '@', 'action'], ['Target weight', '0.0%', 'targetW'], ['Weight now', '0.0%', 'weightNow'], ['Order (£)', '£#,##0;[Red]-£#,##0', 'orderGBP'],
+  ['Action reason', '@', 'actionWhy'],
   ['12m price change', '+0%;[Red]-0%', 'mom12'], ['Price vs 200-day average', '+0%;[Red]-0%', 'vs200'],
   ['Sort key', '0.000', 'F:sort']
 ];
@@ -1585,6 +1603,8 @@ function recalcValuations() {
   if (!out.length) return;
   // Alphabetical, so the Stock view dropdown (which lists Calc tickers) is easy to search.
   out.sort(function (a, b) { return a.ticker < b.ticker ? -1 : a.ticker > b.ticker ? 1 : 0; });
+  var orders = [];
+  try { orders = planPortfolio_(out, market, S, tv); } catch (e) { log_('', 'Portfolio rules: ' + e.message); }
   var rows = out.map(function (v, i) {
     var r = i + 2;
     return CALC_COLS.map(function (c) {
@@ -1596,6 +1616,7 @@ function recalcValuations() {
   });
   sh.getRange(2, 1, rows.length, CALC_COLS.length).setValues(rows);
   CALC_COLS.forEach(function (c, i) { sh.getRange(2, i + 1, rows.length, 1).setNumberFormat(c[1]); });
+  try { writeOrders_(orders); } catch (e) { log_('', 'Orders tab: ' + e.message); }
 
   snapshotHistory_(out, today);
 }
@@ -1723,7 +1744,9 @@ var HOLDINGS_COLS = [
   ['Next earnings', 'Next earnings', '@', 110], ['Last EPS surprise', 'Last EPS surprise', '+0.0%;[Red]-0.0%', 80],
   ['EPS est. change 90d', 'EPS estimate change 90d', '+0.0%;[Red]-0.0%', 80], ['Revisions 30d', 'Analyst revisions 30d', '@', 100],
   ['Setup', 'Setup', '@', 150], ['Setup checks', 'Setup checks', '@', 420],
-  ['Net debt / EBITDA', 'Net debt / EBITDA', '0.0"x"', 80], ['Interest cover', 'Interest cover', '0.0"x"', 75]
+  ['Net debt / EBITDA', 'Net debt / EBITDA', '0.0"x"', 80], ['Interest cover', 'Interest cover', '0.0"x"', 75],
+  ['Action', 'Action', '@', 70], ['Target weight', 'Target weight', '0.0%', 75], ['Order (£)', 'Order (£)', '£#,##0;[Red]-£#,##0', 80],
+  ['Action reason', 'Action reason', '@', 380]
 ];
 var HOLDINGS_FIRST = 14;
 
@@ -1751,7 +1774,7 @@ var WATCH_COLS = [
   ['Price', 'Price', '#,##0.00'], ['Currency', 'Currency', '@'], ['Fair value', 'Fair value', '#,##0.00'],
   ['Buy below', 'Buy below', '#,##0.00'], ['Upside', 'Upside', '0.0%;[Red]-0.0%'],
   ['Exp. return a year (5 yrs)', 'Exp. 5-yr return (a year)', '0.0%;[Red]-0.0%'], ['Direction', 'Direction', '@'],
-  ['Signal', 'Watch signal', '@'], ['Setup', 'Setup', '@'], ['Implied growth', 'Implied growth (reverse DCF)', '0.0%'],
+  ['Signal', 'Watch signal', '@'], ['Setup', 'Setup', '@'], ['Action', 'Action', '@'], ['Target weight', 'Target weight', '0.0%'], ['Implied growth', 'Implied growth (reverse DCF)', '0.0%'],
   ['Cash runway (months)', 'Cash runway (months)', '0'], ['Dilution 1-yr', 'Dilution 1-yr', '0.0%;[Red]-0.0%'],
   ['Net debt / EBITDA', 'Net debt / EBITDA', '0.0"x"'], ['Interest cover', 'Interest cover', '0.0"x"'],
   ['Analyst target', 'Analyst target', '#,##0.00'], ['PEG', 'PEG', '0.00'],
@@ -1836,13 +1859,292 @@ function writeSetups_(formulasOnly) {
   }
 }
 
+
+/* ======================================================================== */
+/*  PORTFOLIO RULES: mechanical buy / add / hold / trim / sell               */
+/* ======================================================================== */
+/* Every stock gets an Action and a target weight from the rules below; the Orders tab lists the trades
+   that follow, sized in pounds. Tick an order Done when you have placed it: it is logged, Holdings and
+   Cash available are updated, and the next run carries on from there.
+
+   Buy-type setups (Value setup, Compounder, Quality pullback) qualify when Direction >= 75%, Strength >= 5
+   (a missing Trend point is not held against it) and the price needs no more growth than expected.
+   Target = best-ideas cap x (40% + 60% x conviction); conviction blends Strength, expected return, the
+   expectations cushion and Direction. Cyclicals are capped lower. Below the 200-day average a position is
+   built in thirds, at least N days apart (or sooner on a further 10% fall); above it, in one go.
+   Holdings with a warning are halved, then sold if the warning lasts N weekly snapshots. Stretched holdings
+   that no longer qualify, and anything over the hard cap, are trimmed to target. Unqualified and
+   speculative holdings are held without adding, and trimmed back if above 1.5x the speculative cap.
+   New money only goes to qualifying stocks, best first; what is left stays in cash. */
+var ORDERS = { NAME: 'Orders', LOG: 'Order log', RULES: 'Rules' };
+var WARN_SETUPS = { 'Value, estimates falling': 1, 'Trend broken': 1, 'High debt': 1, 'Cash burner': 1 };
+
+function portfolioSettings_() {
+  var m = assumptionsMap_();
+  var g = function (label) {
+    var row = SETTINGS.filter(function (r) { return r[0] === label; })[0];
+    var v = m[label];
+    return v === '' || v === undefined || v === null ? (row ? row[1] : null) : Number(v);
+  };
+  return { cash: g('Cash available (£)') || 0, reserve: g('Cash reserve'), maxBest: g('Max position (best ideas)'),
+    maxCyc: g('Max position (cyclical)'), maxSpec: g('Max position (speculative)'), maxInd: g('Max per industry'),
+    hardCap: g('Trim if any position above'), minOrder: g('Minimum order (£)'), addDays: g('Days between adds'),
+    warnWeeks: g('Weeks of warnings before selling'), stretch: num0_(m['Stretched if 5-yr expected return below'], 0.06) };
+}
+function num0_(v, d) { return v === '' || v === undefined || v === null || isNaN(Number(v)) ? d : Number(v); }
+
+/** Price of one share in pounds. */
+function toGBP_(price, ccy, fxUsd, fx) {
+  if (!(price > 0)) return null;
+  if (ccy === 'GBX') return price / 100;
+  if (ccy === 'GBP' || !ccy) return price;
+  if (ccy === 'USD') return fxUsd ? price * fxUsd : null;
+  return fx[ccy + 'GBP'] ? price * fx[ccy + 'GBP'] : null;
+}
+
+function planPortfolio_(out, market, S, tv) {
+  var ss = SpreadsheetApp.getActive(), P = portfolioSettings_();
+  var fxR = ss.getRangeByName('FX_USDGBP'), fxUsd = fxR ? Number(fxR.getValue()) || null : null;
+  var ccys = {};
+  out.forEach(function (v) { var c = (market[v.ticker] || {}).currency; if (c && ['GBX', 'GBP', 'USD'].indexOf(c) < 0) ccys[c + 'GBP'] = 1; });
+  var fx = fxRates_(Object.keys(ccys));
+  // Holdings: ticker -> shares, value in pounds
+  var hs = ss.getSheetByName(SHEET.HOLDINGS), hold = {};
+  if (hs.getLastRow() > 1) hs.getRange(2, 1, hs.getLastRow() - 1, 10).getValues().forEach(function (r) {
+    var t = String(r[0]).trim().toUpperCase(); if (!t) return;
+    hold[t] = { shares: Number(r[3]) || 0, value: typeof r[9] === 'number' ? r[9] : 0 };
+  });
+  var invested = Object.keys(hold).reduce(function (a, t) { return a + hold[t].value; }, 0);
+  var total = invested + P.cash;
+  if (!(total > 0)) return [];
+  // Warning streaks (weekly History snapshots) and the order log
+  var warnWeeks = warningStreaks_(), log = orderLogIndex_();
+  var byInd = {};
+  out.forEach(function (v) {
+    var m = market[v.ticker] || {};
+    v.priceGBP = toGBP_(m.price, m.currency, fxUsd, fx); v.localPrice = m.price; v.localCcy = m.currency || '';
+    var h = hold[v.ticker]; v.valueNow = h ? h.value : 0; v.weightNow = v.valueNow / total;
+    var ind = v.industry || v.sector || 'Other'; byInd[ind] = (byInd[ind] || 0) + v.weightNow; v.indKey = ind;
+  });
+  var clip = function (x) { return Math.max(0, Math.min(1, x)); };
+  var orders = [], sells = 0;
+  out.forEach(function (v) {
+    v.action = ''; v.targetW = ''; v.orderGBP = ''; v.actionWhy = '';
+    var held = v.valueNow > 0;
+    var buyType = v.setup === 'Value setup' || v.setup === 'Compounder' || v.setup === 'Quality pullback';
+    var strengthAdj = (v.setupScore || 0) + (v.trendUp === true ? 0 : 1);
+    var gap = typeof v.expGap === 'number' ? v.expGap : null;
+    var qualifies = buyType && (v.scorePct || 0) >= 0.75 && strengthAdj >= 5 && (gap === null || gap <= 0.02);
+    var warned = !!WARN_SETUPS[v.setup];
+    var why = [];
+    if (qualifies) {
+      var conv = (clip((strengthAdj - 5) / 2) + clip(((v.expRet || 0.1) - 0.10) / 0.15) + clip(-(gap || 0) / 0.3) + clip(((v.scorePct || 0) - 0.75) / 0.25)) / 4;
+      var cap = v.deepCyclical ? P.maxCyc : P.maxBest;
+      v.targetW = cap * (0.4 + 0.6 * conv);
+      why.push(v.setup + ', strength ' + v.setupScore + '/7, direction ' + Math.round((v.scorePct || 0) * 100) + '%');
+    } else if (held) {
+      v.targetW = v.speculative || v.thinTargets || v.type === 'Pre-profit' ? Math.min(v.weightNow, P.maxSpec) : v.weightNow;
+    }
+    if (!v.priceGBP) { v.action = held ? 'Hold' : ''; if (held) v.actionWhy = 'No price in pounds yet'; return; }
+    // --- sells and trims (holdings) ---
+    if (held) {
+      var streak = warnWeeks[v.ticker] || 0, trimmedSince = log.lastTrimAfter(v.ticker, streak);
+      var amt = 0;
+      if (warned) {
+        if (streak >= P.warnWeeks) { amt = v.valueNow; v.action = 'Sell'; why.push(v.setup, 'warning for ' + streak + ' weeks'); }
+        else if (!trimmedSince) { amt = v.valueNow / 2; v.action = 'Trim'; why.push(v.setup, 'first warning: halve'); }
+        else { v.action = 'Hold'; why.push('Warning (' + v.setup + '), already halved; sell if it lasts ' + P.warnWeeks + ' weeks'); }
+        v.targetW = amt === v.valueNow ? 0 : (v.valueNow - amt) / total;
+      } else if (v.weightNow > P.hardCap) {
+        var tgt = qualifies ? Math.min(v.targetW, P.hardCap) : P.maxBest;
+        amt = v.valueNow - tgt * total; v.action = 'Trim'; why.push('Over ' + Math.round(P.hardCap * 100) + '% of the portfolio');
+      } else if (!qualifies && !buyType && (v.scorePct || 0) < 0.75 && typeof v.expRet === 'number' && v.expRet < P.stretch && v.weightNow > P.maxSpec) {
+        amt = v.valueNow / 3; v.action = 'Trim'; why.push('Stretched (expected return ' + Math.round(v.expRet * 100) + '% a year), no buy setup and business not improving strongly: trim a third');
+        v.targetW = (v.valueNow - amt) / total;
+      } else if (!qualifies && (v.speculative || v.thinTargets || v.type === 'Pre-profit') && v.weightNow > 1.5 * P.maxSpec) {
+        amt = v.valueNow - P.maxSpec * total; v.action = 'Trim'; why.push('Speculative: trim to ' + (P.maxSpec * 100).toFixed(1) + '% cap');
+        v.targetW = P.maxSpec;
+      }
+      if (amt >= P.minOrder) {
+        orders.push({ action: v.action, v: v, gbp: -amt, why: why.join('; ') });
+        sells += amt; v.orderGBP = -amt; v.actionWhy = why.join('; ');
+        byInd[v.indKey] -= amt / total;
+        return;
+      }
+      if (v.action === 'Trim' || v.action === 'Sell') v.action = 'Hold';
+    }
+    // --- buys and adds ---
+    if (qualifies && v.targetW > v.weightNow) {
+      var gapW = v.targetW - v.weightNow, tranche = v.targetW / 3;
+      var last = log.lastBuy(v.ticker);
+      var stepOK = v.trendUp === true || !last || last.days >= P.addDays || (v.localPrice && last.price && v.localPrice <= last.price * 0.9);
+      if (!stepOK) { v.action = held ? 'Hold' : 'Wait'; v.actionWhy = 'Next third due ' + (P.addDays - last.days) + ' days after last buy (or on a 10% fall)'; return; }
+      var w = v.trendUp === true ? gapW : Math.min(gapW, tranche);
+      v.action = held ? 'Add' : 'Buy';
+      v.pendingW = w; v.priority = v.targetW;
+      v.actionWhy = why.concat(v.trendUp === true ? ['above 200-day average: full position'] : ['below 200-day average: building in thirds']).join('; ');
+      return;
+    }
+    if (held && !v.action) { v.action = 'Hold'; v.actionWhy = qualifies ? 'At target' : (v.setup ? v.setup + ': no adds' : 'Does not qualify for adds'); }
+    else if (!held && buyType && !qualifies) { v.action = 'Watch'; v.actionWhy = 'Setup but not all rules: ' + [(v.scorePct || 0) < 0.75 ? 'direction under 75%' : '', strengthAdj < 5 ? 'strength under 5' : '', gap !== null && gap > 0.02 ? 'priced for more growth than expected' : ''].filter(String).join(', '); }
+  });
+  // Allocate cash to buys, strongest first, within the reserve and industry caps.
+  var budget = P.cash + sells - P.reserve * total;
+  out.filter(function (v) { return v.pendingW > 0; }).sort(function (a, b) { return b.priority - a.priority; }).forEach(function (v) {
+    var wantW = v.pendingW, room = P.maxInd - (byInd[v.indKey] || 0);
+    if (room <= 0) { v.action = 'Wait'; v.actionWhy = 'Industry at its ' + Math.round(P.maxInd * 100) + '% cap'; return; }
+    var gbp = Math.min(wantW, room) * total;
+    if (gbp > budget) gbp = budget;
+    if (gbp < P.minOrder) { v.action = v.valueNow > 0 ? 'Hold' : 'Wait'; v.actionWhy = budget < P.minOrder ? 'Qualifies, but no cash left after reserve' : 'Order below minimum'; return; }
+    budget -= gbp; byInd[v.indKey] = (byInd[v.indKey] || 0) + gbp / total;
+    v.orderGBP = gbp;
+    orders.push({ action: v.action, v: v, gbp: gbp, why: v.actionWhy });
+  });
+  orders.sort(function (a, b) { var o = { Sell: 0, Trim: 1, Buy: 2, Add: 3 }; return o[a.action] - o[b.action] || Math.abs(b.gbp) - Math.abs(a.gbp); });
+  orders.meta = { total: total, cash: P.cash, invested: invested, reserve: P.reserve * total, sells: sells,
+    buys: orders.filter(function (o) { return o.gbp > 0; }).reduce(function (a, o) { return a + o.gbp; }, 0) };
+  return orders;
+}
+
+/** Consecutive weekly History snapshots (latest backwards) in which each ticker had a warning setup. */
+function warningStreaks_() {
+  var sh = SpreadsheetApp.getActive().getSheetByName(SHEET2.HIST), out = {};
+  if (!sh || sh.getLastRow() < 2 || sh.getLastColumn() < 6) return out;
+  var rows = sh.getRange(2, 1, sh.getLastRow() - 1, 6).getValues(), by = {};
+  rows.forEach(function (r) { var t = String(r[1]).toUpperCase(); if (t) (by[t] = by[t] || []).push([String(r[0]), String(r[5] || '')]); });
+  Object.keys(by).forEach(function (t) {
+    var a = by[t].sort(function (x, y) { return x[0] < y[0] ? 1 : -1; }), n = 0;
+    for (var i = 0; i < a.length; i++) { if (WARN_SETUPS[a[i][1]]) n++; else break; }
+    out[t] = n;
+  });
+  return out;
+}
+
+/** Order log lookups: last buy (days ago, local price) and whether a trim was done during the current warning. */
+function orderLogIndex_() {
+  var sh = SpreadsheetApp.getActive().getSheetByName(ORDERS.LOG), rows = [];
+  if (sh && sh.getLastRow() > 1) rows = sh.getRange(2, 1, sh.getLastRow() - 1, 7).getValues();
+  var now = Date.now();
+  var days = function (d) { var t = d instanceof Date ? d.getTime() : Date.parse(d); return isNaN(t) ? 9999 : (now - t) / 864e5; };
+  return {
+    lastBuy: function (t) {
+      var b = null;
+      rows.forEach(function (r) { if (String(r[2]).toUpperCase() === t && (r[1] === 'Buy' || r[1] === 'Add')) { var d = days(r[0]); if (!b || d < b.days) b = { days: d, price: Number(r[5]) || null }; } });
+      return b;
+    },
+    lastTrimAfter: function (t, weeks) {
+      var limit = Math.max(weeks, 1) * 7 + 3;
+      return rows.some(function (r) { return String(r[2]).toUpperCase() === t && r[1] === 'Trim' && days(r[0]) <= limit; });
+    }
+  };
+}
+
+var ORDER_COLS = ['Done', 'Action', 'Ticker', 'Name', 'Amount (£)', 'Approx. shares', 'Price (local)', 'Currency',
+  'Weight now', 'Target weight', 'Setup', 'Strength', 'Reason'];
+function writeOrders_(orders) {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ensureSheet_(ORDERS.NAME, ORDER_COLS);
+  sh.getRange(1, 1, 1, ORDER_COLS.length).setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#1F3A5F');
+  if (sh.getMaxRows() > 1) sh.getRange(2, 1, sh.getMaxRows() - 1, ORDER_COLS.length + 4).clearContent().clearDataValidations();
+  var rows = orders.map(function (o) {
+    var v = o.v, sh_ = v.priceGBP ? Math.abs(o.gbp) / v.priceGBP : '';
+    return [false, o.action, v.ticker, v.name || '', Math.round(Math.abs(o.gbp)), sh_ === '' ? '' : Math.round(sh_ * 100) / 100,
+      v.localPrice || '', v.localCcy, v.weightNow, v.targetW === '' ? '' : v.targetW, v.setup || '', v.setupScore === null ? '' : v.setupScore, o.why];
+  });
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, ORDER_COLS.length).setValues(rows);
+    sh.getRange(2, 1, rows.length, 1).insertCheckboxes();
+    sh.getRange(2, 5, rows.length, 1).setNumberFormat('£#,##0');
+    sh.getRange(2, 9, rows.length, 2).setNumberFormat('0.0%');
+  } else sh.getRange(2, 2).setValue('No orders: nothing qualifies to buy and no holding triggers a sell or trim.');
+  var M = orders.meta || {};
+  var sc = ORDER_COLS.length + 2;
+  var summary = [['Summary', ''], ['Portfolio value (£)', M.total || ''], ['Invested (£)', M.invested || ''], ['Cash available (£)', M.cash || 0],
+    ['Cash reserve kept (£)', M.reserve || ''], ['Sells and trims (£)', M.sells || 0], ['Buys and adds (£)', M.buys || 0],
+    ['Cash after orders (£)', (M.cash || 0) + (M.sells || 0) - (M.buys || 0)], ['Updated', new Date()], ['', ''],
+    ['How to use', 'Place each order with your broker, then tick Done. The trade is logged, Holdings and Cash available are updated, and the list is recalculated. Correct shares or cash afterwards if the fill differed. Rules and limits: Rules tab and Assumptions.']];
+  sh.getRange(1, sc, summary.length, 2).setValues(summary);
+  sh.getRange(2, sc + 1, 7, 1).setNumberFormat('£#,##0');
+  sh.getRange(1, sc, 1, 2).setFontWeight('bold');
+  sh.getRange(summary.length, sc + 1).setWrap(true);
+  sh.setColumnWidth(sc, 170); sh.setColumnWidth(sc + 1, 320);
+  [60, 60, 70, 180, 90, 90, 90, 70, 80, 90, 140, 70, 420].forEach(function (w, i) { sh.setColumnWidth(i + 1, w); });
+  sh.setFrozenRows(1);
+}
+
+/** Tick Done on the Orders tab: log the trade, update Holdings and cash. */
+function executeOrder_(row) {
+  var ss = SpreadsheetApp.getActive(), sh = ss.getSheetByName(ORDERS.NAME);
+  var r = sh.getRange(row, 1, 1, ORDER_COLS.length).getValues()[0];
+  var action = r[1], t = String(r[2]).toUpperCase(), gbp = Number(r[4]) || 0, shares = Number(r[5]) || 0, price = r[6], ccy = r[7];
+  if (!t || !action || !(shares > 0)) return;
+  var log = ensureSheet_(ORDERS.LOG, ['Date', 'Action', 'Ticker', 'Amount (£)', 'Shares', 'Price (local)', 'Currency', 'Reason']);
+  log.appendRow([new Date(), action, t, gbp, shares, price, ccy, r[12]]);
+  var hs = ss.getSheetByName(SHEET.HOLDINGS);
+  var vals = hs.getLastRow() > 1 ? hs.getRange(2, 1, hs.getLastRow() - 1, 5).getValues() : [];
+  var idx = -1; vals.forEach(function (x, i) { if (String(x[0]).toUpperCase() === t) idx = i; });
+  var buy = action === 'Buy' || action === 'Add';
+  if (buy) {
+    if (idx >= 0) {
+      var s0 = Number(vals[idx][3]) || 0, c0 = Number(vals[idx][4]) || 0;
+      hs.getRange(idx + 2, 4, 1, 2).setValues([[s0 + shares, (s0 * c0 + gbp) / (s0 + shares)]]);
+    } else {
+      var mk = '';
+      var tk = ss.getSheetByName(SHEET.TICKERS).getRange(2, 1, Math.max(ss.getSheetByName(SHEET.TICKERS).getLastRow() - 1, 1), 3).getValues();
+      tk.forEach(function (x) { if (String(x[0]).toUpperCase() === t) mk = String(x[2] || 'US').toUpperCase(); });
+      var market = mk === 'US' || mk === '' ? 'US-listed shares' : mk === 'UK' ? 'UK shares' : mk + ' shares';
+      var at = Math.max(hs.getLastRow() + 1, 2);
+      hs.getRange(at, 1, 1, 5).setValues([[t, r[3], market, shares, gbp / shares]]);
+    }
+  } else if (idx >= 0) {
+    var left = (Number(vals[idx][3]) || 0) - shares;
+    if (action === 'Sell' || left <= 1e-6) hs.deleteRow(idx + 2); else hs.getRange(idx + 2, 4).setValue(left);
+  }
+  // Cash available
+  var a = ss.getSheetByName(SHEET.ASSUME), labels = a.getRange(1, 1, a.getLastRow(), 1).getValues();
+  labels.forEach(function (l, i) {
+    if (String(l[0]).trim() === 'Cash available (£)') {
+      var c = Number(a.getRange(i + 1, 2).getValue()) || 0;
+      a.getRange(i + 1, 2).setValue(Math.round((c + (buy ? -gbp : gbp)) * 100) / 100);
+    }
+  });
+  writeHoldingsFormulas_();
+}
+
+var RULES_TEXT = [
+  ['How the rules work', ''],
+  ['1. Gate', 'Only stocks whose business is improving qualify: Direction 75% or higher.'],
+  ['2. Rank', 'Buy-type setup (Value setup, Compounder, Quality pullback) with Strength 5+ out of 7. A missing Trend point is not held against it.'],
+  ['3. Confirm', 'Forecasts must not be falling (built into the setups) and the price must need no more growth than expected (Expectations gap 2% or lower).'],
+  ['4. Size', 'Target weight = best-ideas cap x (40% + 60% x conviction). Conviction blends Strength, expected return, the expectations cushion and Direction. Cyclicals use the lower cyclical cap.'],
+  ['5. Buy', 'Above the 200-day average: buy the full target. Below it: buy a third now, the next third after the set number of days or on a further 10% fall.'],
+  ['6. Cash', 'Money goes to qualifying stocks, strongest first, keeping the cash reserve and the per-industry cap. Anything left stays in cash until the next opportunity.'],
+  ['7. Warnings', 'Value, estimates falling / Trend broken / High debt / Cash burner on a holding: halve it, then sell the rest if the warning lasts the set number of weeks.'],
+  ['8. Trims', 'Any holding above the hard cap is trimmed to target. Stretched holdings (expected return below the Stretched level) with no buy setup and Direction under 75% are trimmed by a third: winners whose business is still improving strongly are left to run. Speculative holdings above 1.5x the speculative cap are trimmed to the cap.'],
+  ['9. Hold', 'Everything else is held. Unqualified holdings are never added to.'],
+  ['', ''],
+  ['Your routine', 'Check the Orders tab after the morning data update. Place the orders, tick Done. Nothing else is needed; change the limits on Assumptions if you want a different style.'],
+  ['', ''],
+  ['Actions', 'Buy / Add: place the order shown. Trim / Sell: reduce as shown. Hold: nothing to do. Wait: qualifies but waiting (next third not due, industry cap, or no cash). Watch: a setup that misses a rule.'],
+  ['', ''],
+  ['Limits of the rules', 'The cash-burner veto is the only rule proven in the back-test (2023-26, your own trades). The setups have not yet been tested on outcomes: the History tab is recording them weekly so they can be. The rules decide; they cannot know news the data has not caught.']
+];
+function writeRulesTab_() {
+  var sh = ensureSheet_(ORDERS.RULES, ['Rule', 'What it does']);
+  sh.getRange(1, 1, RULES_TEXT.length, 2).setValues(RULES_TEXT).setWrap(true).setVerticalAlignment('top');
+  sh.getRange(1, 1, 1, 2).setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#1F3A5F');
+  sh.getRange(2, 1, RULES_TEXT.length - 1, 1).setFontWeight('bold');
+  sh.setColumnWidth(1, 170); sh.setColumnWidth(2, 760);
+}
+
 /** Colours for Status and Signal columns (replaces earlier rules on these tabs). */
 function writeColourRules_() {
   var ss = SpreadsheetApp.getActive();
   var colours = { 'Stretched': '#F4C7C3', 'Above fair value': '#FCE8B2', 'Fair': '#E8EAED', 'Cheap': '#B7E1CD',
     'Buy zone': '#B7E1CD', 'Approaching': '#D9EAD3', 'Value trap?': '#FCE8B2', 'Speculative': '#D9D2E9',
     'Value setup': '#B7E1CD', 'Compounder': '#C9DAF8', 'Quality pullback': '#D0E0E3', 'Value, estimates falling': '#FFF2CC', 'Trend broken': '#F4C7C3',
-    'Thin targets': '#E8EAED', 'Cash burner': '#E6B8AF', 'High debt': '#F9CB9C' };
+    'Thin targets': '#E8EAED', 'Cash burner': '#E6B8AF', 'High debt': '#F9CB9C',
+    'Buy': '#B7E1CD', 'Add': '#D9EAD3', 'Trim': '#FCE8B2', 'Sell': '#F4C7C3', 'Wait': '#FFF2CC', 'Watch': '#E8EAED' };
   var apply = function (sh, a1s) {
     if (!sh) return;
     var ranges = a1s.map(function (a) { return sh.getRange(a); }), rules = [];
@@ -1852,8 +2154,9 @@ function writeColourRules_() {
     sh.setConditionalFormatRules(rules);
   };
   var span = function (L) { return L + '2:' + L + '500'; };
-  apply(ss.getSheetByName(SHEET.HOLDINGS), [span(holdingsCol_('Status')), span(holdingsCol_('Setup'))]);
-  apply(ss.getSheetByName(SHEET2.WATCH), [span(watchCol_('Signal')), span(watchCol_('Setup'))]);
+  apply(ss.getSheetByName(SHEET.HOLDINGS), [span(holdingsCol_('Status')), span(holdingsCol_('Setup')), span(holdingsCol_('Action'))]);
+  apply(ss.getSheetByName(SHEET2.WATCH), [span(watchCol_('Signal')), span(watchCol_('Setup')), span(watchCol_('Action'))]);
+  apply(ss.getSheetByName(ORDERS.NAME), ['B2:B500']);
   apply(ss.getSheetByName(SHEET2.CALC), [calcL_('Status') + '2:' + calcL_('Watch signal') + '500', span(calcL_('Setup'))]);
   apply(ss.getSheetByName(SHEET2.SETUPS), ['A2:A500']);
 }
