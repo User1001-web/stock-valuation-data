@@ -162,7 +162,7 @@ async function main() {
       const y = await yahooRow(t.ticker, t.ticker.replace(/\./g, '-'), 'YAHOO');
       if (y['Latest period end'] && Date.parse(y['Latest period end']) > Date.parse(secEnd) + 60 * 864e5 &&
           (!y.Currency || !row.Currency || y.Currency === row.Currency)) {
-        const match = (y._trailing || []).find(r => Math.abs(Date.parse(r.iso) - Date.parse(secEnd)) <= 20 * 864e5);
+        const match = (y._trailing || []).find(r => Math.abs(Date.parse(r.iso) - Date.parse(secEnd)) <= 20 * 864e5 && ukVal(r, 'Revenue') !== '');
         let verified = false, check = 'no overlapping period to check against the SEC';
         if (match) {
           const yr = ukVal(match, 'Revenue'), yn = ukVal(match, 'NetIncome');
