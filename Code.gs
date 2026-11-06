@@ -1388,10 +1388,10 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
    Compounder   - looks expensive, but the price assumes less growth than the company delivers,
                   with high returns on capital, rising estimates and a rising price.
    Quality pullback - quality business, analysts raising estimates, but the price has fallen below its 200-day average.
-   Value, waiting for trend - cheap, but estimates are being cut, or the price is falling without estimates rising.
+   Value, estimates falling - cheap, but analysts are cutting forecasts (the classic value-trap pattern).
    Trend broken - a quality grower that is not cheap, with the price falling and estimates no longer rising.
    Thin targets - big analyst upside resting on few analysts or a very wide range of targets. */
-var SETUP_RANK = { 'Value setup': 1, 'Compounder': 2, 'Quality pullback': 3, 'Value, waiting for trend': 4, 'Trend broken': 5, 'High debt': 6, 'Thin targets': 7, 'Cash burner': 8 };
+var SETUP_RANK = { 'Value setup': 1, 'Compounder': 2, 'Quality pullback': 3, 'Value, estimates falling': 4, 'Trend broken': 5, 'High debt': 6, 'Thin targets': 7, 'Cash burner': 8 };
 function setupFor_(out, raw, price, eps, type, S) {
   out.setup = ''; out.setupScore = null; out.setupChecks = ''; out.setupRank = '';
   // Veto: burning cash AND priced far above fundamentals (over 3x fair value, or over 15x sales).
@@ -1427,11 +1427,13 @@ function setupFor_(out, raw, price, eps, type, S) {
   var s = '';
   var debtOK = !out.highDebt;
   if (!debtOK && !spec) s = 'High debt';
-  else if (!spec && cheap && analystsAgree && !estDown && dir >= 0.6 && !trendDown) s = 'Value setup';
+  // Long-term investing: a falling price does not block a setup (the best prices are often below trend);
+  // falling analyst forecasts do.
+  else if (!spec && cheap && analystsAgree && !estDown && dir >= 0.6) s = 'Value setup';
   else if (!spec && !cheap && roic !== null && roic >= 0.12 && dir >= 0.75 && growth >= 0.12 && pricedIn && estUp &&
     trendUp !== false && (tUp === null || tUp > 0)) s = 'Compounder';
-  else if (!spec && trendDown && estUp && dir >= 0.6 && roic !== null && roic >= 0.12 && analystsAgree && (cheap || pricedIn)) s = 'Quality pullback';
-  else if (!spec && cheap && dir >= 0.5 && (estDown || trendDown)) s = 'Value, waiting for trend';
+  else if (!spec && trendDown && !estDown && dir >= 0.6 && roic !== null && roic >= 0.12 && analystsAgree && pricedIn) s = 'Quality pullback';
+  else if (!spec && cheap && dir >= 0.5 && estDown) s = 'Value, estimates falling';
   else if (!spec && !cheap && roic !== null && roic >= 0.12 && growth >= 0.1 && !estUp && (trendDown || (v2 !== null && v2 < -0.15))) s = 'Trend broken';
   else if (tUp !== null && tUp >= 0.3 && thin) s = 'Thin targets';
   out.setup = s; out.setupRank = s ? SETUP_RANK[s] : '';
@@ -1792,10 +1794,10 @@ var SETUP_COLS = [
 ];
 var SETUP_HELP = [
   ['What the setups mean', ''],
-  ['Value setup', 'At or below fair value, analysts see 15%+ upside (5+ analysts), estimates not being cut, Direction 60%+, price not in a downtrend.'],
+  ['Value setup', 'At or below fair value, analysts see 15%+ upside (5+ analysts), estimates not being cut, Direction 60%+. A falling price does not block it: for long-term investors the best prices are often below trend.'],
   ['Compounder', 'Looks expensive on fair value, but the price assumes less growth (Implied growth) than the company is delivering. ROIC 12%+, Direction 75%+, estimates rising, price above its 200-day average.'],
-  ['Quality pullback', 'ROIC 12%+, analysts raising estimates and seeing 15%+ upside, but the price has fallen 5%+ below its 200-day average. Either cheap, or priced for less growth than delivered. Often the chance to buy a strong performer on a dip.'],
-  ['Value, waiting for trend', 'Cheap, but estimates are being cut, or the price is falling without estimates rising. Often early: wait for estimates or the trend to turn.'],
+  ['Quality pullback', 'Above fair value, but priced for less growth than it delivers. ROIC 12%+, estimates not being cut, analysts see 15%+ upside, and the price is 5%+ below its 200-day average. Often the chance to buy a strong performer on a dip.'],
+  ['Value, estimates falling', 'Cheap, but analysts are cutting forecasts. The classic value-trap pattern: wait for forecasts to stop falling.'],
   ['Trend broken', 'A quality grower, not cheap, with the price 5%+ below its 200-day average and estimates no longer rising. For holdings: time to review or trim.'],
   ['High debt', 'Net debt over 3.5x EBITDA (6x for utilities), EBITDA under 3x interest, or net debt with no operating profit. Blocks the buy-type setups. Banks and insurers are excluded.'],
   ['Cash burner', 'Veto: negative free cash flow and priced over 3x fair value or 15x sales. In a back-test on your 2023-26 trades, almost none of these beat the S&P 500.'],
@@ -1839,7 +1841,7 @@ function writeColourRules_() {
   var ss = SpreadsheetApp.getActive();
   var colours = { 'Stretched': '#F4C7C3', 'Above fair value': '#FCE8B2', 'Fair': '#E8EAED', 'Cheap': '#B7E1CD',
     'Buy zone': '#B7E1CD', 'Approaching': '#D9EAD3', 'Value trap?': '#FCE8B2', 'Speculative': '#D9D2E9',
-    'Value setup': '#B7E1CD', 'Compounder': '#C9DAF8', 'Quality pullback': '#D0E0E3', 'Value, waiting for trend': '#FFF2CC', 'Trend broken': '#F4C7C3',
+    'Value setup': '#B7E1CD', 'Compounder': '#C9DAF8', 'Quality pullback': '#D0E0E3', 'Value, estimates falling': '#FFF2CC', 'Trend broken': '#F4C7C3',
     'Thin targets': '#E8EAED', 'Cash burner': '#E6B8AF', 'High debt': '#F9CB9C' };
   var apply = function (sh, a1s) {
     if (!sh) return;
