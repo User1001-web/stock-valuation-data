@@ -876,7 +876,7 @@ var SETTINGS = [
   ['Exit P/E cap', 25, '0.0', 'Exit multiples = 8.5 + 2 x later growth (%), capped here.'],
   ['Exit P/FCF cap', 30, '0.0', ''],
   ['Margin of safety', 0.25, '0%', 'Buy-below price = fair value x (1 - this).'],
-  ['Subtract stock-based comp from FCF', 'No', '@', 'Yes or No.'],
+  ['Subtract stock-based comp from FCF', 'Yes', '@', 'Yes or No. Yes treats stock pay as the real cost it is (shareholders pay through dilution).'],
   ['Growth stock threshold (3-yr revenue CAGR)', 0.15, '0%', 'Profitable companies whose average of 1-yr and 3-yr revenue growth exceeds this are classed as Growth.'],
   ['Default long-run FCF margin (pre-profit)', 0.15, '0%', 'Used when a company has no positive margin history. Per-stock override on Tickers.'],
   ['Default long-run net margin (pre-profit)', 0.12, '0%', ''],
@@ -1248,7 +1248,16 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var dil = null;
   if (shares1) { var ratio = shares / shares1; if (ratio > 0.6 && ratio < 1.6) dil = ratio - 1; }
   out.dilution = dil;
-  var dilP = dil === null ? 0 : clamp_(dil, -0.05, 0.15);
+  // Projected dilution for the 5-year models. When stock pay is already subtracted from free cash flow, the
+  // shares it creates (roughly stock pay / market value each year) are taken out, so the cost is not counted
+  // twice; dilution from fund-raising and acquisitions, and shrinkage from buybacks, still count.
+  var dilProj = dil;
+  if (dil !== null && S.sbc && sbc) {
+    var mcapNow = price && shares ? price * shares / (fx || 1) : null;
+    dilProj = mcapNow > 0 ? dil - Math.abs(sbc) / mcapNow : Math.min(dil, 0);
+    if (dil > 0 && dilProj < 0) dilProj = 0;   // stock pay explains all the dilution
+  }
+  var dilP = dilProj === null ? 0 : clamp_(dilProj, -0.05, 0.15);
 
   var allowed = MODELS_BY_TYPE[type];
   var M = {};
@@ -1380,6 +1389,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   out.grossMargin = F('GrossProfit TTM') !== null && rev ? F('GrossProfit TTM') / rev : null;
   out.opMargin = F('OperatingIncome TTM') !== null && rev ? F('OperatingIncome TTM') / rev : null;
   out.fcfMargin = fcfMarginNow;
+  out.fcfCashMargin = ocf !== null && rev ? (ocf - capex) / rev : null;   // actual cash, before any stock-pay deduction
   out.netCash = netCash;
   out.pe = price && eps > 0 ? price / eps : null;
   out.evSales = price && rev ? (price * shares - netCash) / rev : null;
@@ -1443,10 +1453,12 @@ function setupFor_(out, raw, price, eps, type, S) {
   out.setup = ''; out.setupScore = null; out.setupChecks = ''; out.setupRank = '';
   // Veto: burning cash AND priced far above fundamentals (over 3x fair value, or over 15x sales).
   // In the 2023-26 back-test on your own trades, almost none of these beat the index.
-  if (price && out.fcfMargin !== null && out.fcfMargin !== undefined && out.fcfMargin < 0 &&
-      ((out.fv && price > 3 * out.fv) || (out.evSales !== null && out.evSales !== undefined && out.evSales > 15))) {
+  // Uses actual cash flow (before deducting stock pay), as in the back-test that supports this rule.
+  var cashM = out.fcfCashMargin !== null && out.fcfCashMargin !== undefined ? out.fcfCashMargin : out.fcfMargin;
+  if (price && cashM !== null && cashM !== undefined && cashM < 0 &&
+      (!out.fv || price > 3 * out.fv || (out.evSales !== null && out.evSales !== undefined && out.evSales > 15))) {
     out.setup = 'Cash burner'; out.setupRank = SETUP_RANK['Cash burner']; out.setupScore = 0;
-    out.setupChecks = 'Negative free cash flow' + (out.fv ? ', price ' + (price / out.fv).toFixed(1) + 'x fair value' : '') +
+    out.setupChecks = 'Negative free cash flow' + (out.fv ? ', price ' + (price / out.fv).toFixed(1) + 'x fair value' : ', no fair value from fundamentals') +
       (out.evSales > 15 ? ', ' + Math.round(out.evSales) + 'x sales' : '') + '. Avoid unless you have a strong, specific reason.';
     return;
   }
