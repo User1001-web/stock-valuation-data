@@ -1104,16 +1104,16 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var estYears = fy0End && fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - dnum_(String(fy0End).slice(0, 10))) / 365.25, 1, 3.5) : 2;
   var yearsAhead = fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - today) / 365.25, 0.5, 3) : 2;
   var gridG = n_(ovr.gridGrowth);   // set only by the Stock view sensitivity grid
-  if (gridG !== null) { g0 = gridG; basis = 'Sensitivity scenario'; }
-  else if (ovG !== null) { g0 = ovG > 1.5 ? ovG / 100 : ovG; basis = 'Override'; }
+  // Consensus path: growth from the latest 12 months (the base every model projects from) to the analysts'
+  // second-year revenue, over the time actually left until then. Measuring from the last full fiscal year
+  // would count the part of this year already reported twice.
+  var latestEnd = raw['Latest period end'] ? dnum_(String(raw['Latest period end']).slice(0, 10)) : null;
+  var yrsToFY2 = consensus && latestEnd !== null && fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - latestEnd) / 365.25, 0.75, 3.5) : (estYears || 2);
+  var revBase = rev > 0 ? rev : r0;
+  var gCons = consensus ? Math.pow(estRev2 / revBase, 1 / yrsToFY2) - 1 : null;
+  if (ovG !== null && gridG === null) { g0 = ovG > 1.5 ? ovG / 100 : ovG; basis = 'Override'; }
   else if (consensus) {
-    // Growth from the latest 12 months (the base every model projects from) to the analysts' second-year
-    // revenue, over the time actually left until then. Measuring from the last full fiscal year would count
-    // the part of this year already reported twice.
-    var latestEnd = raw['Latest period end'] ? dnum_(String(raw['Latest period end']).slice(0, 10)) : null;
-    var yrsToFY2 = latestEnd !== null && fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - latestEnd) / 365.25, 0.75, 3.5) : estYears;
-    var revBase = rev > 0 ? rev : r0;
-    g0 = Math.pow(estRev2 / revBase, 1 / yrsToFY2) - 1;
+    g0 = gCons;
     basis = 'Analyst consensus revenue growth (' + (n_(raw['Est analysts']) || '?') + ' analysts, ' + (raw['Est source'] || 'estimates') + ')';
   } else {
     var avg = mean_([yoy, cagr3]);
@@ -1122,6 +1122,8 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   }
   var g0raw = g0;
   var leadOK = consensus && ovG === null && ni !== null && ni > 0 && type !== 'Financial' && (n_(raw['Est analysts']) || 0) >= 5;
+  // Sensitivity grid without an analyst path: the scenario growth replaces the start rate.
+  if (gridG !== null && !leadOK) { g0 = gridG; g0raw = gridG; basis = 'Sensitivity scenario'; }
   g0 = clamp_(g0, S.gFloor, gridG !== null && !leadOK ? Math.max(S.gCap, gridG) : S.gCap);
   // Profitable companies with 5+ analysts: follow the consensus revenue path to the second forecast year (even
   // above the cap), then fade from the analysts' growth in that year (capped). Loss-makers and thinly covered
@@ -1137,8 +1139,15 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     // Fade start: the lower of the analysts' second-year growth and their average pace to that year (so a dip
     // and rebound is not read as lasting momentum), capped for the years beyond the forecasts.
     g0 = clamp_(Math.min(y2g, g0raw), S.gTerm, Math.min(S.gCap, S.gFadeCap || 0.25));
+    // Sensitivity grid: shift the whole analyst path (forecast years and fade start) by the scenario's difference.
+    if (gridG !== null) {
+      var dG = gridG - leadG;
+      leadG = Math.max(gridG, -0.5);
+      g0 = clamp_(g0 + dG, S.gFloor, Math.max(Math.min(S.gCap, S.gFadeCap || 0.25), g0 + dG));
+      basis = 'Sensitivity scenario';
+    }
     lead = { g: leadG, n: nLead };
-    basis += ' for ' + nLead + ' year' + (nLead > 1 ? 's' : '') + ', then fading from ' + Math.round(g0 * 100) + '%';
+    if (gridG === null) basis += ' for ' + nLead + ' year' + (nLead > 1 ? 's' : '') + ', then fading from ' + Math.round(g0 * 100) + '%';
   } else if (g0 !== g0raw && basis !== 'Override' && gridG === null) basis += g0raw > g0 ? ' (capped)' : ' (floored)';
   if (trough && !consensus && ovG === null && gridG === null && g0 < S.gTerm) { g0 = S.gTerm; basis = 'Cycle trough: terminal growth assumed'; }
   var gT = S.gTerm, path = growthPath_(g0, gT, lead);
