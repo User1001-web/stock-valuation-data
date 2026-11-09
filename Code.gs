@@ -893,7 +893,7 @@ var SETTINGS = [
   ['Trim if any position above', 0.15, '0%', 'Any holding above this is trimmed back to its target.'],
   ['Minimum order (£)', 250, '£#,##0', 'Smaller orders are skipped.'],
   ['Days between adds', 28, '0', 'Below the 200-day average, positions are built in thirds, at least this many days apart (or sooner on a further 10% fall).'],
-  ['Max new money per week', 0.25, '0%', 'Pace limit: buys in any 7 days stop at this share of the cash available at the start of that week (sale proceeds are added on top). 100% = no limit.'],
+  ['Max new money per week', 0.25, '0%', 'Pace limit: buys in any 7 days stop at this share of the cash available at the start of that week. 100% = no limit.'],
   ['Max new positions per week', 4, '0', 'At most this many first-time buys in any 7 days (adds to existing holdings do not count).'],
   ['Weeks of warnings before selling', 4, '0', 'A warning setup (Value, estimates falling / Trend broken / High debt / Cash burner) first halves the position; if it lasts this many weekly snapshots, the rest is sold.']
 ];
@@ -2070,12 +2070,14 @@ function planPortfolio_(out, market, S, tv) {
     else if (!held && buyType && !qualifies) { v.action = 'Watch'; v.actionWhy = 'Setup but not all rules: ' + [(v.scorePct || 0) < 0.75 ? 'direction under 75%' : '', strengthAdj < 5 ? 'strength under 5' : '', gap !== null && gap > 0.02 ? 'priced for more growth than expected' : ''].filter(String).join(', '); }
   });
   // Allocate cash to buys, strongest first, within the reserve and industry caps.
-  var budget = P.cash + sells - P.reserve * total;
+  // Only cash already in the account is spent: money from trims and sales counts once they are ticked Done
+  // (which adds it to Cash available and recalculates).
+  var budget = P.cash - P.reserve * total;
   // Pace: spread new money over weeks. The weekly allowance is a share of the cash held at the start of the
   // 7-day window (cash now + what was spent in it), less what was already spent; sale proceeds are added on top.
   var wk = log.weekBuys(), paceNote = '';
   if (P.pace !== null && P.pace < 1) {
-    var allowance = Math.max(0, P.pace * (P.cash + wk.gbp) - wk.gbp) + sells;
+    var allowance = Math.max(0, P.pace * (P.cash + wk.gbp) - wk.gbp);
     if (allowance < budget) { budget = allowance; paceNote = 'weekly pace limit'; }
   }
   var newLeft = P.newPerWeek === null ? 99 : Math.max(0, P.newPerWeek - wk.newCount);
@@ -2156,13 +2158,13 @@ function writeOrders_(orders) {
   var sc = ORDER_COLS.length + 2;
   var summary = [['Summary', ''], ['Portfolio value (£)', M.total || ''], ['Invested (£)', M.invested || ''], ['Cash available (£)', M.cash || 0],
     ['Cash reserve kept (£)', M.reserve || ''], ['Sells and trims (£)', M.sells || 0], ['Buys and adds (£)', M.buys || 0],
-    ['Cash after orders (£)', (M.cash || 0) + (M.sells || 0) - (M.buys || 0)], ['Updated', new Date()],
+    ['Cash after buys (£)', (M.cash || 0) - (M.buys || 0)], ['Cash after sells are done (£)', (M.cash || 0) - (M.buys || 0) + (M.sells || 0)], ['Updated', new Date()],
     ['Stocks in the plan', M.qualifiers || 0],
     ['Targets scaled to fit', M.scale !== undefined && M.scale < 1 ? Math.round(M.scale * 100) + '% of stand-alone size' : 'No'], ['', ''],
     ['How to use', 'Place each order, then tick Done.'], ['', 'Holdings and Cash available update automatically.'],
     ['', 'Correct shares or cash if the fill differed.'], ['', 'Rules and limits: Rules tab and Assumptions.']];
   sh.getRange(1, sc, summary.length, 2).setValues(summary);
-  sh.getRange(2, sc + 1, 7, 1).setNumberFormat('£#,##0');
+  sh.getRange(2, sc + 1, 8, 1).setNumberFormat('£#,##0');
   sh.getRange(1, sc, 1, 2).setFontWeight('bold');
   sh.getRange(1, sc, summary.length, 2).setWrap(false);
   sh.setColumnWidth(sc, 170); sh.setColumnWidth(sc + 1, 320);
