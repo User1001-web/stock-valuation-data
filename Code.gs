@@ -881,6 +881,7 @@ var SETTINGS = [
   ['Default long-run FCF margin (pre-profit)', 0.15, '0%', 'Used when a company has no positive margin history. Per-stock override on Tickers.'],
   ['Default long-run net margin (pre-profit)', 0.12, '0%', ''],
   ['Stretched if 5-yr expected return below', 0.06, '0%', ''],
+  ['Max growth after forecast years', 0.25, '0%', 'After the analysts\' forecast years, growth fades to the terminal rate starting from at most this.'],
   ['Max data age (months)', 15, '0', 'Older SEC data is not valued.'],
   ['Cash available (£)', 0, '£#,##0', 'PORTFOLIO RULES. Uninvested cash in your account. Updated automatically when you tick an order Done on the Orders tab; correct it here after trades.'],
   ['Cash reserve', 0.05, '0%', 'Share of the portfolio always kept in cash.'],
@@ -911,7 +912,7 @@ function settingsFromMap_(m) {
     aaa: aao !== '' && aao !== undefined && aao !== null ? Number(aao) : num('AAA corporate bond yield'),
     erp: num('Equity risk premium'), betaMin: num('Beta floor'), betaMax: num('Beta cap'),
     betaDefault: num('Beta if missing'), rMin: num('Discount rate floor'), rMax: num('Discount rate cap'),
-    req: num('Required return (5-year models)'), gCap: num('Starting growth cap'), gFloor: num('Growth floor'),
+    req: num('Required return (5-year models)'), gCap: num('Starting growth cap'), gFadeCap: num('Max growth after forecast years'), gFloor: num('Growth floor'),
     gTerm: num('Terminal growth'), peCap: num('Exit P/E cap'), pfcfCap: num('Exit P/FCF cap'),
     mos: num('Margin of safety'), sbc: /^y/i.test(String(g('Subtract stock-based comp from FCF'))),
     growthThreshold: num('Growth stock threshold (3-yr revenue CAGR)'),
@@ -1074,7 +1075,10 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var type;
   var ovType = String(ovr.type || '').trim();
   if (ovType && MODELS_BY_TYPE[ovType]) { type = ovType; out.notes.push('Type set by override'); }
-  else if (((sic >= 6000 && sic <= 6299) || sic === 6726) && !(rev && capex / rev > 0.1)) type = 'Financial';
+  // Banks, brokers, insurers (6311-6411: their cash flow includes policyholders' premiums, so free-cash-flow
+  // models overstate them; health plans, 6324, excluded as they run like service businesses) and investment
+  // trusts are valued as financials.
+  else if (((sic >= 6000 && sic <= 6299) || (sic >= 6311 && sic <= 6411 && sic !== 6324) || sic === 6726) && !(rev && capex / rev > 0.1)) type = 'Financial';
   else if ((raw.CIK === 'LSE' && !raw.Sector) || ((raw.CIK === 'LSE' || raw.CIK === 'YAHOO') && (raw.Sector === 'Financial Services' || raw.Sector === 'Real Estate'))) type = 'Financial';
   else if ((ni === null || ni <= 0) && !trough) type = 'Pre-profit';
   else if ((mean_([yoy, cagr3]) || 0) >= S.growthThreshold) type = 'Growth';
@@ -1090,6 +1094,12 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     consensus = false;
     out.notes.push('Analyst revenue forecast uses a different revenue definition (' + (estRev2 / r0).toFixed(2) + 'x reported); history used for growth');
   }
+  var estRev1m = F('Est revenue FY1'), latestEndM = raw['Latest period end'];
+  if (consensus && estRev1m > 0 && rev > 0 && estRev1m < 0.85 * rev && raw['Est FY1 end'] && latestEndM &&
+      (dnum_(String(raw['Est FY1 end']).slice(0, 10)) - dnum_(String(latestEndM).slice(0, 10))) / 365.25 <= 0.6) {
+    consensus = false;
+    out.notes.push('Analysts\' revenue for this year is ' + Math.round((1 - estRev1m / rev) * 100) + '% below the latest 12 months: a different revenue definition; history used for growth');
+  }
   var fy0End = raw['Latest FY end'], fy2End = raw['Est FY2 end'] || '';
   var estYears = fy0End && fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - dnum_(String(fy0End).slice(0, 10))) / 365.25, 1, 3.5) : 2;
   var yearsAhead = fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - today) / 365.25, 0.5, 3) : 2;
@@ -1097,7 +1107,13 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   if (gridG !== null) { g0 = gridG; basis = 'Sensitivity scenario'; }
   else if (ovG !== null) { g0 = ovG > 1.5 ? ovG / 100 : ovG; basis = 'Override'; }
   else if (consensus) {
-    g0 = Math.pow(estRev2 / r0, 1 / estYears) - 1;
+    // Growth from the latest 12 months (the base every model projects from) to the analysts' second-year
+    // revenue, over the time actually left until then. Measuring from the last full fiscal year would count
+    // the part of this year already reported twice.
+    var latestEnd = raw['Latest period end'] ? dnum_(String(raw['Latest period end']).slice(0, 10)) : null;
+    var yrsToFY2 = latestEnd !== null && fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - latestEnd) / 365.25, 0.75, 3.5) : estYears;
+    var revBase = rev > 0 ? rev : r0;
+    g0 = Math.pow(estRev2 / revBase, 1 / yrsToFY2) - 1;
     basis = 'Analyst consensus revenue growth (' + (n_(raw['Est analysts']) || '?') + ' analysts, ' + (raw['Est source'] || 'estimates') + ')';
   } else {
     var avg = mean_([yoy, cagr3]);
@@ -1107,12 +1123,22 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var g0raw = g0;
   var leadOK = consensus && ovG === null && ni !== null && ni > 0 && type !== 'Financial' && (n_(raw['Est analysts']) || 0) >= 5;
   g0 = clamp_(g0, S.gFloor, gridG !== null && !leadOK ? Math.max(S.gCap, gridG) : S.gCap);
-  // Profitable companies with 5+ analysts: trust the consensus for the forecast years even above the cap,
-  // then fade from the cap. Loss-makers and thinly covered stocks stay capped from year 1.
+  // Profitable companies with 5+ analysts: follow the consensus revenue path to the second forecast year (even
+  // above the cap), then fade from the analysts' growth in that year (capped). Loss-makers and thinly covered
+  // stocks use one capped start rate that fades from year 1.
   var lead = null;
-  if (leadOK && g0raw > S.gCap) {
-    lead = { g: Math.min(g0raw, 1), n: 2 };
-    basis += ' for 2 years, then fading from ' + Math.round(S.gCap * 100) + '%';
+  if (leadOK) {
+    // Analysts' growth until their second forecast year, then a fade that starts from their growth in that
+    // year (FY1 to FY2), never above the cap.
+    var nLead = Math.max(1, Math.min(2, Math.round(yrsToFY2)));
+    var leadG = Math.min(Math.pow(estRev2 / revBase, 1 / nLead) - 1, 1);
+    var estRev1 = F('Est revenue FY1');
+    var y2g = estRev1 > 0 ? estRev2 / estRev1 - 1 : g0raw;
+    // Fade start: the lower of the analysts' second-year growth and their average pace to that year (so a dip
+    // and rebound is not read as lasting momentum), capped for the years beyond the forecasts.
+    g0 = clamp_(Math.min(y2g, g0raw), S.gTerm, Math.min(S.gCap, S.gFadeCap || 0.25));
+    lead = { g: leadG, n: nLead };
+    basis += ' for ' + nLead + ' year' + (nLead > 1 ? 's' : '') + ', then fading from ' + Math.round(g0 * 100) + '%';
   } else if (g0 !== g0raw && basis !== 'Override' && gridG === null) basis += g0raw > g0 ? ' (capped)' : ' (floored)';
   if (trough && !consensus && ovG === null && gridG === null && g0 < S.gTerm) { g0 = S.gTerm; basis = 'Cycle trough: terminal growth assumed'; }
   var gT = S.gTerm, path = growthPath_(g0, gT, lead);
@@ -1237,11 +1263,14 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var taxR = F('IncomeTax TTM') !== null && F('PretaxIncome TTM') ? clamp_(F('IncomeTax TTM') / F('PretaxIncome TTM'), 0, 0.35) : 0.21;
   var icE = (equity || 0) + debt - cash, opE = F('OperatingIncome TTM');
   var roicE = opE !== null && icE > 0 ? opE * (1 - taxR) / icE : null;
-  var qualityMult = !peak && (type === 'Growth' || type === 'Mature') && roicE !== null && roicE >= 0.2;
+  // ...and a gross margin of 40%+, the mark of pricing power (a high ROIC alone can come from running on
+  // suppliers' money, as in hardware distribution).
+  var gmNowQ = F('GrossProfit TTM') !== null && rev ? F('GrossProfit TTM') / rev : null;
+  var qualityMult = !peak && (type === 'Growth' || type === 'Mature') && roicE !== null && roicE >= 0.2 && gmNowQ !== null && gmNowQ >= 0.4;
   var peCapX = qualityMult ? S.peCap * 1.4 : S.peCap, pfCapX = qualityMult ? S.pfcfCap * 1.4 : S.pfcfCap;
   var peLater = exitMultiple_(avgRange(6, 10), peCapX);
   var pfLater = exitMultiple_(avgRange(6, 10), pfCapX);
-  if (qualityMult && exitMultiple_(avgRange(6, 10), S.peCap) >= S.peCap) out.notes.push('High-return business (ROIC ' + Math.round(roicE * 100) + '%): exit P/E cap raised to ' + Math.round(peCapX));
+  if (qualityMult && exitMultiple_(avgRange(6, 10), S.peCap) >= S.peCap) out.notes.push('High-return business (ROIC ' + Math.round(roicE * 100) + '%, gross margin ' + Math.round(gmNowQ * 100) + '%): exit P/E cap raised to ' + Math.round(peCapX));
 
   if (fcfBase !== null && fcfBase > 0 && type !== 'Financial') M['DCF'] = dcfPerShare_(fcfBase, g0, gT, r, netCash, shares, lead);
   if (hasRev && type !== 'Financial') {
