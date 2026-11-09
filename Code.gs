@@ -1281,7 +1281,19 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var pfLater = exitMultiple_(avgRange(6, 10), pfCapX);
   if (qualityMult && exitMultiple_(avgRange(6, 10), S.peCap) >= S.peCap) out.notes.push('High-return business (ROIC ' + Math.round(roicE * 100) + '%, gross margin ' + Math.round(gmNowQ * 100) + '%): exit P/E cap raised to ' + Math.round(peCapX));
 
-  if (fcfBase !== null && fcfBase > 0 && type !== 'Financial') M['DCF'] = dcfPerShare_(fcfBase, g0, gT, r, netCash, shares, lead);
+  // DCF on cash flow to the whole business: free cash flow (after interest under US accounting) plus after-tax
+  // interest, discounted at the blended cost of equity and debt (WACC); debt is then subtracted once, as net debt.
+  var intPaid = F('InterestExpense TTM'), dcfCF = fcfBase, dcfR = r;
+  if (fcfBase !== null && debt > 0 && intPaid && price && shares) {
+    var eqV = price * shares / (fx || 1);
+    // Cost of debt: today's borrowing cost, at least the AAA corporate bond yield (interest paid / debt reflects
+    // older, cheaper loans). The blended rate never goes below the minimum discount rate.
+    var rd = clamp_(Math.max(Math.abs(intPaid) / debt, S.aaa || 0.05), 0.03, 0.12);
+    dcfCF = fcfBase + Math.abs(intPaid) * (1 - taxR);
+    dcfR = Math.max((eqV * r + debt * rd * (1 - taxR)) / (eqV + debt), gT + 0.02, S.rMin);
+    out.wacc = dcfR;
+  }
+  if (fcfBase !== null && fcfBase > 0 && type !== 'Financial') M['DCF'] = dcfPerShare_(dcfCF, g0, gT, dcfR, netCash, shares, lead);
   if (hasRev && type !== 'Financial') {
     M['FCF future market cap'] = projection5_(projRev, g0, gT, mF, pfLater, shares, dilP, S.req, projYears, lead).fv;
     var p5 = projection5_(projRev, g0, gT, mN, peLater, shares, dilP, S.req, projYears, lead);
@@ -1348,7 +1360,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   if (price) {
     var sol = null;
     if (fcfBase !== null && fcfBase > 0 && type !== 'Financial') {
-      sol = solveGrowth_(function (g) { return dcfPerShare_(fcfBase, g, gT, r, netCash, shares); }, price);
+      sol = solveGrowth_(function (g) { return dcfPerShare_(dcfCF, g, gT, dcfR, netCash, shares); }, price);
       out.impliedBasis = 'DCF';
     } else if (hasRev && type !== 'Financial') {
       sol = solveGrowth_(function (g) { return projection5_(projRev, g, gT, mF, pfLater, shares, dilP, S.req, projYears).fv; }, price);
@@ -1377,8 +1389,8 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   // same DCF value as the model's own path. Differs from g0 only when analysts' 2-year forecasts lead the path.
   out.gComparable = g0;
   if (lead && fcfBase !== null && fcfBase > 0 && type !== 'Financial') {
-    var target = dcfPerShare_(fcfBase, g0, gT, r, netCash, shares, lead);
-    var eq = solveGrowth_(function (g) { return dcfPerShare_(fcfBase, g, gT, r, netCash, shares); }, target);
+    var target = dcfPerShare_(dcfCF, g0, gT, dcfR, netCash, shares, lead);
+    var eq = solveGrowth_(function (g) { return dcfPerShare_(dcfCF, g, gT, dcfR, netCash, shares); }, target);
     if (eq.g !== null) out.gComparable = eq.g;
   } else if (lead) out.gComparable = lead.g;
   out.expGap = typeof out.implied === 'number' ? out.implied - out.gComparable : null;
