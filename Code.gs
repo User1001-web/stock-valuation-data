@@ -977,7 +977,10 @@ var MODELS_BY_TYPE = {
   'Mature': ['DCF', 'FCF future market cap', '5-yr earnings', 'Fwd EPS x P/E', 'Graham', 'Dividend discount'],
   'Growth': ['DCF', 'FCF future market cap', '5-yr earnings', 'Fwd EPS x P/E', 'Graham', 'Lynch', 'Dividend discount'],
   'Pre-profit': ['FCF future market cap', '5-yr earnings'],
-  'Financial': ['Justified P/B', 'Fwd EPS x P/E', 'Dividend discount']
+  'Financial': ['Justified P/B', 'Fwd EPS x P/E', 'Dividend discount'],
+  // Regulated utilities invest more than they generate in cash (paid for by borrowing and rate increases), so
+  // cash-flow models fail; investors value them on earnings and dividends.
+  'Utility': ['Fwd EPS x P/E', 'Dividend discount', 'Graham']
 };
 
 /**
@@ -1080,6 +1083,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   // trusts are valued as financials.
   else if (((sic >= 6000 && sic <= 6299) || (sic >= 6311 && sic <= 6411 && sic !== 6324) || sic === 6726) && !(rev && capex / rev > 0.1)) type = 'Financial';
   else if ((raw.CIK === 'LSE' && !raw.Sector) || ((raw.CIK === 'LSE' || raw.CIK === 'YAHOO') && (raw.Sector === 'Financial Services' || raw.Sector === 'Real Estate'))) type = 'Financial';
+  else if (sic >= 4900 && sic <= 4949 && ni !== null && ni > 0 && !/Independent|Renewable/i.test(String(raw['Yahoo industry'] || ''))) type = 'Utility';
   else if ((ni === null || ni <= 0) && !trough) type = 'Pre-profit';
   else if ((mean_([yoy, cagr3]) || 0) >= S.growthThreshold) type = 'Growth';
   else type = 'Mature';
@@ -1095,11 +1099,21 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     out.notes.push('Analyst revenue forecast uses a different revenue definition (' + (estRev2 / r0).toFixed(2) + 'x reported); history used for growth');
   }
   var estRev1m = F('Est revenue FY1'), latestEndM = raw['Latest period end'];
+  var restructured = false;
   if (consensus && estRev1m > 0 && rev > 0 && estRev1m < 0.85 * rev && raw['Est FY1 end'] && latestEndM &&
       (dnum_(String(raw['Est FY1 end']).slice(0, 10)) - dnum_(String(latestEndM).slice(0, 10))) / 365.25 <= 0.6) {
-    consensus = false;
-    out.notes.push('Analysts\' revenue for this year is ' + Math.round((1 - estRev1m / rev) * 100) + '% below the latest 12 months: a different revenue definition; history used for growth');
+    var gapPct = Math.round((1 - estRev1m / rev) * 100);
+    if (type === 'Financial') {
+      consensus = false;
+      out.notes.push('Analysts\' revenue for this year is ' + gapPct + '% below the latest 12 months: a different revenue definition; history used for growth');
+    } else {
+      // A company does not lose 15%+ of its revenue in the rest of a year: it has been split up, sold a business
+      // or changed its reporting. Its history no longer describes it, so it is valued on analysts' forecasts only.
+      restructured = true;
+      out.notes.push('Restructured (spin-off, sale or reporting change): analysts expect revenue ' + gapPct + '% below the latest 12 months. Valued on forecast earnings only until new filings arrive');
+    }
   }
+  out.restructured = restructured;
   var fy0End = raw['Latest FY end'], fy2End = raw['Est FY2 end'] || '';
   var estYears = fy0End && fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - dnum_(String(fy0End).slice(0, 10))) / 365.25, 1, 3.5) : 2;
   var yearsAhead = fy2End ? clamp_((dnum_(String(fy2End).slice(0, 10)) - today) / 365.25, 0.5, 3) : 2;
@@ -1120,8 +1134,13 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     g0 = avg === null ? S.gTerm : avg;
     basis = yoy !== null && cagr3 !== null ? 'Avg of 1-yr and 3-yr revenue growth' : yoy !== null ? '1-yr revenue growth' : cagr3 !== null ? '3-yr revenue growth' : 'No history (terminal rate)';
   }
+  if (restructured && ovG === null) {
+    var e1r = n_(raw['Est EPS FY1']);
+    g0 = e1r > 0 && estEps2 > 0 ? estEps2 / e1r - 1 : S.gTerm;
+    basis = 'Analysts\' EPS growth (company restructured)';
+  }
   var g0raw = g0;
-  var leadOK = consensus && ovG === null && ni !== null && ni > 0 && type !== 'Financial' && (n_(raw['Est analysts']) || 0) >= 5;
+  var leadOK = consensus && !restructured && ovG === null && ni !== null && ni > 0 && type !== 'Financial' && (n_(raw['Est analysts']) || 0) >= 5;
   // Sensitivity grid without an analyst path: the scenario growth replaces the start rate.
   if (gridG !== null && !leadOK) { g0 = gridG; g0raw = gridG; basis = 'Sensitivity scenario'; }
   g0 = clamp_(g0, S.gFloor, gridG !== null && !leadOK ? Math.max(S.gCap, gridG) : S.gCap);
@@ -1198,7 +1217,10 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var gmFY = fyMargins(function (i) { return fy('GrossProfit', i); });
   if (out.grossMarginNow === undefined && F('GrossProfit TTM') !== null && rev) gmFY.push(F('GrossProfit TTM') / rev);
   var gmSwing = gmFY.length >= 3 ? Math.max.apply(null, gmFY) - Math.min.apply(null, gmFY) : 0;
-  var deepCyc = cyclicalSic && established && netFY.some(function (x) { return x < 0.03; }) && gmSwing >= 0.15;
+  // Oil and gas producers, refiners and miners sell commodities: their margins follow prices, so they are always
+  // treated as cyclical (no loss year needed).
+  var commodity = (sic >= 1000 && sic <= 1499) || sic === 2911;
+  var deepCyc = cyclicalSic && established && (commodity || (netFY.some(function (x) { return x < 0.03; }) && gmSwing >= 0.15));
   out.deepCyclical = deepCyc;
   // Cyclical peak: a deep cyclical with revenue up 50%+ in a year, earning well above its cycle-average margin
   // (over 1.5x, and over 15%). Long-run margins are set halfway between today's and the cycle average (this year
@@ -1208,8 +1230,11 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var lastYear = prevNet.length ? prevNet[0] : null;
   var analystsSeeGrowth = consensus && estRev2 >= (rev || 0) * 0.95;
   var cycAvgNet = mean_([netMarginNow].concat(netFY).filter(function (x) { return x !== null; }));
-  var peak = deepCyc && ovM === null && yoy !== null && yoy > 0.5 && netMarginNow !== null && cycAvgNet !== null &&
-    netMarginNow > 0.15 && netMarginNow > 1.5 * Math.max(cycAvgNet, 0.02);
+  // Commodity producers: a margin well above the cycle average is enough (their revenue need not jump; refiners'
+  // margins are thin, so the bar is 5%, not 15%).
+  var peak = deepCyc && ovM === null && netMarginNow !== null && cycAvgNet !== null &&
+    (commodity ? netMarginNow > 0.05 && netMarginNow > 1.5 * Math.max(cycAvgNet, 0.02)
+               : yoy !== null && yoy > 0.5 && netMarginNow > 0.15 && netMarginNow > 1.5 * Math.max(cycAvgNet, 0.02));
   out.cyclicalPeak = peak;
   var fcfBase = fcf, epsBase = eps;
   // One-off charges: TTM net margin below half its typical (median) level while operating cash flow is
@@ -1232,8 +1257,15 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   if (peak) {
     var cycFcf = mean_([fcfMarginNow].concat(fcfFY).filter(function (x) { return x !== null; }));
     var mid = function (now, avg) { return now === null ? avg : (now + avg) / 2; };
-    mN = Math.max(mid(netMarginNow, cycAvgNet), 0.02);
-    mF = Math.max(mid(fcfMarginNow, cycFcf !== null ? cycFcf : cycAvgNet), 0.02);
+    // ...but never above today's margins (a peak is not a reason to assume more).
+    // ...but never above today's margins: a peak only ever lowers them.
+    // (For commodity producers also never above the model's usual median margins.)
+    var capN = commodity ? Math.min(netMarginNow, mN) : netMarginNow;
+    mN = Math.max(Math.min(mid(netMarginNow, cycAvgNet), capN), 0.02);
+    var fcfMid = mid(fcfMarginNow, cycFcf !== null ? cycFcf : cycAvgNet);
+    var capF = fcfMarginNow !== null && fcfMarginNow > 0 ? fcfMarginNow : fcfMid;
+    if (commodity) capF = Math.min(capF, mF);
+    mF = Math.max(Math.min(fcfMid, capF), 0.02);
     fcfBase = rev * mF; epsBase = rev * mN / shares;
     // Revenue at a peak is inflated by boom prices, so growth on top of it is limited to 15% (analysts' forecasts
     // of further gains are mostly further price rises).
@@ -1241,7 +1273,10 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
       g0 = analystsSeeGrowth ? Math.min(g0, 0.15) : clamp_(cagr3 === null ? gT : cagr3, gT, 0.15);
       out.gBasis = 'Cyclical peak: growth from peak revenue limited to 15%';
     }
-    lead = null; path = growthPath_(g0, gT); out.g0 = g0;
+    // Analysts forecasting falling revenue (prices coming down) is kept; forecasts of further gains are not.
+    if (lead && lead.g < 0 && gridG === null) { g0 = gT; out.gBasis = 'Cyclical peak: analysts\' falling revenue, then terminal growth'; }
+    else lead = null;
+    path = growthPath_(g0, gT, lead); out.g0 = lead ? lead.g : g0;
     out.notes.push('Cyclical peak: margins at ' + Math.round(netMarginNow * 100) + '% vs cycle average ' + Math.round(cycAvgNet * 100) +
       '%; valued on margins halfway between the two (' + Math.round(mN * 100) + '%). See the margin grid on Stock view');
   }
@@ -1268,7 +1303,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   }
   var dilP = dilProj === null ? 0 : clamp_(dilProj, -0.05, 0.15);
 
-  var allowed = MODELS_BY_TYPE[type];
+  var allowed = restructured ? ['Fwd EPS x P/E'] : MODELS_BY_TYPE[type];
   var M = {};
   var hasRev = rev !== null && rev >= 25e6;
   // Pre-revenue: start the revenue projection from analysts' forecast instead (speculative).
@@ -1328,7 +1363,9 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     // Dividend growth (perpetual, so no higher than terminal growth): 3-year growth in dividend per share where available.
     var d0 = fy('DividendsPaid', 0), d3 = fy('DividendsPaid', 3), s0 = n_(raw['DilutedShares FY0']), s3 = n_(raw['DilutedShares FY-3']);
     var dpsCagr = d0 && d3 && s0 && s3 && d3 > 0 ? Math.pow(Math.abs(d0) / s0 / (Math.abs(d3) / s3), 1 / 3) - 1 : null;
-    var gD = dpsCagr !== null && isFinite(dpsCagr) ? clamp_(dpsCagr, 0, gT) : clamp_(avgRange(1, 10), 0, gT);
+    // Regulated utilities: dividend growth up to 5% (their rate base grows with regulated investment).
+    var gDcap = type === 'Utility' ? 0.05 : gT;
+    var gD = dpsCagr !== null && isFinite(dpsCagr) ? clamp_(dpsCagr, 0, gDcap) : clamp_(avgRange(1, 10), 0, gDcap);
     gD = Math.min(gD, r - 0.02);
     M['Dividend discount'] = div / shares * (1 + gD) / (r - gD);
   }
@@ -1368,10 +1405,11 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   // Reverse DCF: what year-1 growth (fading to terminal) the price implies
   if (price) {
     var sol = null;
-    if (fcfBase !== null && fcfBase > 0 && type !== 'Financial') {
+    if (restructured) { sol = null; out.impliedBasis = 'n/a (restructured)'; }
+    else if (fcfBase !== null && fcfBase > 0 && type !== 'Financial' && type !== 'Utility') {
       sol = solveGrowth_(function (g) { return dcfPerShare_(dcfCF, g, gT, dcfR, netCash, shares); }, price);
       out.impliedBasis = 'DCF';
-    } else if (hasRev && type !== 'Financial') {
+    } else if (hasRev && type !== 'Financial' && type !== 'Utility') {
       sol = solveGrowth_(function (g) { return projection5_(projRev, g, gT, mF, pfLater, shares, dilP, S.req, projYears).fv; }, price);
       out.impliedBasis = 'Revenue projection';
     }
