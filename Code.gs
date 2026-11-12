@@ -2542,7 +2542,7 @@ function renderStockView_() {
   var area = sh.getRange(G0, C0, 10, 8);
   area.breakApart().clearContent().setBackground(null).setFontWeight('normal');
   if (!grid) { sh.getRange(G0, C0).setValue('No valuation for this stock.'); return; }
-  var out = [[grid.byMargin ? 'Long-run net margin ↓  Discount rate →' : 'Start growth ↓  Discount rate →'].concat(grid.rVals.map(function (r) { return r; }))];
+  var out = [[grid.byMargin ? 'Long-run net margin ↓  Discount rate →' : 'Expected growth ↓  Discount rate →'].concat(grid.rVals.map(function (r) { return r; }))];
   grid.gVals.forEach(function (g, i) { out.push([g].concat(grid.rows[i])); });
   sh.getRange(G0, C0, out.length, out[0].length).setValues(out);
   sh.getRange(G0, C0 + 1, 1, grid.rVals.length).setNumberFormat('0.0%').setFontWeight('bold').setBackground('#F1EFE8');
@@ -2557,6 +2557,7 @@ function renderStockView_() {
   }
   sh.getRange(G0 + 1 + grid.gVals.length, C0, 1, 8).merge().getCell(1, 1).setValue((grid.byMargin ?
     'Cyclical stock: rows show profit margins from a quarter to 1.5x the model\'s long-run margin (the risk is the cycle turning). ' : '') +
+    (grid.byMargin ? '' : 'Rows: expected growth, on the same scale as Implied growth' + (grid.implied !== null ? ' (' + (grid.implied * 100).toFixed(1) + '% for the cash-flow model alone)' : '') + '. ') +
     'Green where fair value is above today\'s price, red where below. Purple = current settings.')
     .setFontColor('#888780').setFontSize(9);
 }
@@ -2605,20 +2606,24 @@ function sensitivityFor_(t) {
     var r = d === 0 ? base.r : Math.max(base.r + d, S.gTerm + 0.02);
     if (rVals.every(function (x) { return Math.abs(x - r) > 1e-9; })) rVals.push(r);
   });
+  // Row labels on the same scale as the Implied and Expected growth cards (an equivalent start rate fading
+  // to terminal over 10 years), so the grid can be read against implied growth directly.
+  var labels = gVals.slice();
   var rows = gVals.map(function (g, gi) {
-    return rVals.map(function (r) {
+    return rVals.map(function (r, ri) {
       var S2 = {}; for (var k in S) S2[k] = S[k];
       S2.rMin = r; S2.rMax = r; S2.req = Math.max(S.req + (r - base.r), S.gTerm + 0.02);
       var o2 = byMargin ? { type: ovr.type, growth: ovr.growth, margin: ovr.margin, marginScale: scales[gi] }
         : { type: ovr.type, growth: ovr.growth, margin: ovr.margin, gridGrowth: g };
       var v = valueCompany(raw, m, fx, o2, S2, null, today);
+      if (!byMargin && ri === rVals.indexOf(base.r) && typeof v.gComparable === 'number') labels[gi] = v.gComparable;
       // Blend the same models as the base fair value, so scenarios are comparable (no price filter re-selection).
       var vals = (base.used || []).map(function (k) { return v.models[k]; }).filter(function (x) { return x > 0; });
       return vals.length ? median_(vals) : (v.fv ? v.fv : '');
     });
   });
-  return { gVals: gVals, rVals: rVals, rows: rows, baseRow: byMargin ? 3 : gVals.indexOf(base.g0), baseCol: rVals.indexOf(base.r),
-    price: m.price || n_(calc.Price), byMargin: byMargin };
+  return { gVals: labels, rVals: rVals, rows: rows, baseRow: byMargin ? 3 : gVals.indexOf(base.g0), baseCol: rVals.indexOf(base.r),
+    price: m.price || n_(calc.Price), byMargin: byMargin, implied: typeof base.implied === 'number' ? base.implied : null };
 }
 
 /** Menu: show the ticker in the selected row (any tab) on the Stock view. */
