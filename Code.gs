@@ -1368,7 +1368,9 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     // is scaled by the company's own reported / adjusted EPS over the last four quarters (a cut of at most 30%;
     // ignored when the two are on different share bases, or when reported earnings are depressed by one-offs).
     var adjTTM = n_(raw['Adj EPS TTM']), repTTM = n_(raw['EPS TTM']), epsScale = 1;
-    if (useEstEps && !usedImplied && !out.depressedEarnings && adjTTM > 0 && repTTM > 0) {
+    var qEnd = String(raw['Last earnings quarter'] || '').slice(0, 10), pEnd = String(raw['Latest period end'] || '').slice(0, 10);
+    var sameWindow = /^\d{4}-\d\d-\d\d$/.test(qEnd) && /^\d{4}-\d\d-\d\d$/.test(pEnd) && Math.abs(dnum_(qEnd) - dnum_(pEnd)) <= 100;
+    if (useEstEps && sameWindow && !usedImplied && !out.depressedEarnings && adjTTM > 0 && repTTM > 0) {
       var rr = repTTM / adjTTM;
       if (rr >= 0.5 && rr < 0.97) epsScale = Math.max(rr, 0.7);
     }
