@@ -139,7 +139,9 @@ var RAW_COLS = (function () {
     'Target consensus', 'Target high', 'Target low', 'Est FY2 end', 'Est source', 'Sector', 'Yahoo price', 'Yahoo industry',
     'Next earnings', 'Last EPS surprise', 'Last earnings quarter', 'EPS est now', 'EPS est 30d ago', 'EPS est 90d ago',
     'Revisions up 30d', 'Revisions down 30d', 'Est EPS growth 5y', 'Yahoo market cap',
-    '12m price change', 'Price vs 200d avg', 'Price vs 50d avg', 'Off 52w high');
+    '12m price change', 'Price vs 200d avg', 'Price vs 50d avg', 'Off 52w high',
+    'Adj EPS TTM', 'Beta', 'Last split date', 'Last split ratio',
+    'Hist P/E now', 'Hist P/E median', 'Hist P/S now', 'Hist P/S median', 'Hist years');
   return c;
 })();
 
@@ -389,6 +391,7 @@ function refreshFundamentals() {
     if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).clearContent();
     if (result.rows.length) sh.getRange(2, 1, result.rows.length, RAW_COLS.length).setValues(result.rows);
     loadRates_(url);
+    loadBenchmark_(url);
     recalcValuations();
     try { renderStockView_(); } catch (err) { /* view not built yet */ }
 
@@ -1174,6 +1177,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   out.g0 = lead ? lead.g : g0; out.gBasis = basis;
 
   var beta = n_(mkt.beta);
+  if (beta === null) beta = n_(raw.Beta);   // Yahoo's figure when Google Finance has none
   if (beta === null) { beta = S.betaDefault; out.notes.push('No beta; ' + beta + ' assumed'); }
   var r = clamp_(S.rf + clamp_(beta, S.betaMin, S.betaMax) * S.erp, S.rMin, S.rMax);
   if (r - gT < 0.02) r = gT + 0.02;
@@ -1219,8 +1223,9 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var gmSwing = gmFY.length >= 3 ? Math.max.apply(null, gmFY) - Math.min.apply(null, gmFY) : 0;
   // Oil and gas producers, refiners and miners sell commodities: their margins follow prices, so they are always
   // treated as cyclical (no loss year needed).
-  var commodity = (sic >= 1000 && sic <= 1499) || sic === 2911;
-  var deepCyc = cyclicalSic && established && (commodity || (netFY.some(function (x) { return x < 0.03; }) && gmSwing >= 0.15));
+  // (Shipping rates swing the same way.) Size does not matter for these, unlike the other cyclical industries.
+  var commodity = (sic >= 1000 && sic <= 1499) || sic === 2911 || (sic >= 4400 && sic <= 4499);
+  var deepCyc = cyclicalSic && (commodity || (established && netFY.some(function (x) { return x < 0.03; }) && gmSwing >= 0.15));
   out.deepCyclical = deepCyc;
   // Cyclical peak: a deep cyclical with revenue up 50%+ in a year, earning well above its cycle-average margin
   // (over 1.5x, and over 15%). Long-run margins are set halfway between today's and the cycle average (this year
@@ -1297,7 +1302,7 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   // twice; dilution from fund-raising and acquisitions, and shrinkage from buybacks, still count.
   var dilProj = dil;
   if (dil !== null && S.sbc && sbc) {
-    var mcapNow = price && shares ? price * shares / (fx || 1) : null;
+    var mcapNow = price && shares ? price * shares : null;   // F() figures are already in the listing currency
     dilProj = mcapNow > 0 ? dil - Math.abs(sbc) / mcapNow : Math.min(dil, 0);
     if (dil > 0 && dilProj < 0) dilProj = 0;   // stock pay explains all the dilution
   }
@@ -1321,15 +1326,28 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var gmNowQ = F('GrossProfit TTM') !== null && rev ? F('GrossProfit TTM') / rev : null;
   var qualityMult = !peak && (type === 'Growth' || type === 'Mature') && roicE !== null && roicE >= 0.2 && gmNowQ !== null && gmNowQ >= 0.4;
   var peCapX = qualityMult ? S.peCap * 1.4 : S.peCap, pfCapX = qualityMult ? S.pfcfCap * 1.4 : S.pfcfCap;
-  var peLater = exitMultiple_(avgRange(6, 10), peCapX);
-  var pfLater = exitMultiple_(avgRange(6, 10), pfCapX);
+  // Return on capital and the multiple a business deserves: growing at g costs g / ROIC of profit in reinvestment,
+  // so the share of profit left for shareholders is (1 - g / ROIC). Multiples are scaled by that share relative
+  // to a typical 15%-ROIC business, within 0.75x-1.25x. ROIC is read between 6% and 30%, and treated as typical
+  // when book equity is negative (the figure is then an accounting artefact) or at a cyclical peak.
+  var qAdj = 1;
+  if ((type === 'Growth' || type === 'Mature') && roicE !== null && !peak) {
+    var gQ = Math.max(avgRange(6, 10), gT);
+    var roicQ = equity !== null && equity <= 0 ? Math.min(roicE, 0.15) : clamp_(roicE, 0.06, 0.30);
+    qAdj = clamp_((1 - gQ / roicQ) / (1 - gQ / 0.15), 0.75, 1.25);
+  }
+  out.qualityMultiple = qAdj;
+  var exitM = function (g, cap) { return clamp_(exitMultiple_(g, cap) * qAdj, 8, cap); };
+  var peLater = exitM(avgRange(6, 10), peCapX);
+  var pfLater = exitM(avgRange(6, 10), pfCapX);
+  if (qAdj >= 1.1 || qAdj <= 0.9) out.notes.push('Exit multiples ' + (qAdj > 1 ? 'raised ' : 'lowered ') + Math.round(Math.abs(qAdj - 1) * 100) + '% for ' + (qAdj > 1 ? 'high' : 'low') + ' return on capital (ROIC ' + Math.round(roicE * 100) + '%)');
   if (qualityMult && exitMultiple_(avgRange(6, 10), S.peCap) >= S.peCap) out.notes.push('High-return business (ROIC ' + Math.round(roicE * 100) + '%, gross margin ' + Math.round(gmNowQ * 100) + '%): exit P/E cap raised to ' + Math.round(peCapX));
 
   // DCF on cash flow to the whole business: free cash flow (after interest under US accounting) plus after-tax
   // interest, discounted at the blended cost of equity and debt (WACC); debt is then subtracted once, as net debt.
   var intPaid = F('InterestExpense TTM'), dcfCF = fcfBase, dcfR = r;
   if (fcfBase !== null && debt > 0 && intPaid && price && shares) {
-    var eqV = price * shares / (fx || 1);
+    var eqV = price * shares;   // listing currency, like debt (F() converts)
     // Cost of debt: today's borrowing cost, at least the AAA corporate bond yield (interest paid / debt reflects
     // older, cheaper loans). The blended rate never goes below the minimum discount rate.
     var rd = clamp_(Math.max(Math.abs(intPaid) / debt, S.aaa || 0.05), 0.03, 0.12);
@@ -1346,28 +1364,54 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   }
   var useEstEps = consensus && !peak && estEps2 !== null && estEps2 > 0;
   if (useEstEps || (epsBase !== null && epsBase > 0)) {
-    var eps2 = useEstEps ? estEps2 * fx * (mScale !== null ? mScale : 1) : epsBase * (1 + path[0]) * (1 + path[1]);
-    if (useEstEps) out.notes.push('Fwd EPS x P/E uses consensus EPS (analysts often use adjusted EPS)');
+    // Analysts forecast "adjusted" EPS, which leaves out real costs such as stock pay and amortisation. The forecast
+    // is scaled by the company's own reported / adjusted EPS over the last four quarters (a cut of at most 30%;
+    // ignored when the two are on different share bases, or when reported earnings are depressed by one-offs).
+    var adjTTM = n_(raw['Adj EPS TTM']), repTTM = n_(raw['EPS TTM']), epsScale = 1;
+    if (useEstEps && !usedImplied && !out.depressedEarnings && adjTTM > 0 && repTTM > 0) {
+      var rr = repTTM / adjTTM;
+      if (rr >= 0.5 && rr < 0.97) epsScale = Math.max(rr, 0.7);
+    }
+    out.epsScale = epsScale;
+    var eps2 = useEstEps ? estEps2 * fx * epsScale * (mScale !== null ? mScale : 1) : epsBase * (1 + path[0]) * (1 + path[1]);
+    if (useEstEps) out.notes.push(epsScale < 1 ? 'Analysts\' adjusted EPS forecast cut ' + Math.round((1 - epsScale) * 100) + '% to match reported earnings'
+      : 'Fwd EPS x P/E uses consensus EPS (analysts often use adjusted EPS)');
     var epsYears = useEstEps ? yearsAhead : 2;
     // Financials: modest multiple (banks/insurers rarely sustain growth multiples); growth from revenue is unreliable for them.
-    var fwdPE = type === 'Financial' ? clamp_(8.5 + 2 * Math.min(avgRange(3, 7), gT) * 100, 8, Math.min(S.peCap, 14.5)) : exitMultiple_(avgRange(3, 7), peCapX);
+    var fwdPE = type === 'Financial' ? clamp_(8.5 + 2 * Math.min(avgRange(3, 7), gT) * 100, 8, Math.min(S.peCap, 14.5)) : exitM(avgRange(3, 7), peCapX);
     M['Fwd EPS x P/E'] = eps2 * fwdPE / Math.pow(1 + S.req, epsYears);
   }
   if (epsBase !== null && epsBase > 0) {
     var gG = Math.min(avgRange(1, 10) * 100, 15);
     if (S.aaa > 0) M['Graham'] = epsBase * (8.5 + 2 * gG) * 4.4 / (S.aaa * 100);
     var gL = Math.min(avgRange(1, 5) * 100, 25);
-    if (gL >= 5) M['Lynch'] = epsBase * gL;
+    // Lynch's fair P/E = growth rate + dividend yield (his own version; growth alone short-changes payers).
+    var yldPct = price && shares && div > 0 ? Math.min(div / (price * shares) * 100, 6) : 0;
+    if (gL >= 5) M['Lynch'] = epsBase * (gL + yldPct);
   }
-  if (price && div > 0 && div / (price * shares) >= 0.015) {
-    // Dividend growth (perpetual, so no higher than terminal growth): 3-year growth in dividend per share where available.
+  // Shareholder payout model (the "Dividend discount" column): dividends plus net buybacks. Buybacks that only
+  // offset shares issued to staff return nothing, so stock pay is deducted; the payout counted is capped at the
+  // larger of net income and free cash flow (borrowed buybacks cannot last).
+  var buyb = Math.abs(F('Buybacks TTM') || 0);
+  var payout = div + Math.max(0, buyb - Math.abs(sbc));
+  var payCap = Math.max(ni || 0, fcfBase !== null && fcfBase > 0 ? fcfBase : 0);
+  if (payCap > 0) payout = Math.min(payout, payCap); else payout = div;
+  out.payoutYield = price && shares && payout > 0 ? payout / (price * shares) : null;
+  if (price && payout > 0 && out.payoutYield >= 0.015) {
     var d0 = fy('DividendsPaid', 0), d3 = fy('DividendsPaid', 3), s0 = n_(raw['DilutedShares FY0']), s3 = n_(raw['DilutedShares FY-3']);
     var dpsCagr = d0 && d3 && s0 && s3 && d3 > 0 ? Math.pow(Math.abs(d0) / s0 / (Math.abs(d3) / s3), 1 / 3) - 1 : null;
-    // Regulated utilities: dividend growth up to 5% (their rate base grows with regulated investment).
-    var gDcap = type === 'Utility' ? 0.05 : gT;
-    var gD = dpsCagr !== null && isFinite(dpsCagr) ? clamp_(dpsCagr, 0, gDcap) : clamp_(avgRange(1, 10), 0, gDcap);
-    gD = Math.min(gD, r - 0.02);
-    M['Dividend discount'] = div / shares * (1 + gD) / (r - gD);
+    if (type === 'Financial' || type === 'Utility') {
+      // One growth rate for ever: no higher than terminal growth (5% for regulated utilities, whose rate base grows).
+      var gDcap = type === 'Utility' ? 0.05 : gT;
+      var gD = dpsCagr !== null && isFinite(dpsCagr) ? clamp_(dpsCagr, 0, gDcap) : clamp_(avgRange(1, 10), 0, gDcap);
+      gD = Math.min(gD, r - 0.02);
+      M['Dividend discount'] = payout / shares * (1 + gD) / (r - gD);
+    } else {
+      // Two stages: payouts grow with the business for 10 years (at most 10% a year), then at terminal growth.
+      var po = payout / shares, pvP = 0;
+      for (var tp = 1; tp <= 10; tp++) { po *= 1 + clamp_(path[tp - 1], 0, 0.10); pvP += po / Math.pow(1 + r, tp); }
+      M['Dividend discount'] = pvP + po * (1 + gT) / (r - gT) / Math.pow(1 + r, 10);
+    }
   }
   if (equity && equity > 0 && ni !== null) {
     var roe = ni / equity;
@@ -1397,6 +1441,9 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   if (vals.length) {
     out.fv = median_(vals); out.low = Math.min.apply(null, vals); out.high = Math.max.apply(null, vals);
     out.buyBelow = out.fv * (1 - S.mos);
+    // Confidence: how far apart the models are (highest / lowest).
+    out.spread = vals.length > 1 ? out.high / out.low : null;
+    out.confidence = vals.length < 2 ? 'Low' : out.spread <= 2 ? 'High' : out.spread <= 3.5 ? 'Medium' : 'Low';
   }
   out.used = used;
   if (excluded.length) out.notes.push('Excluded as implausible vs price: ' + excluded.join(', '));
@@ -1473,6 +1520,32 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     (out.intCover !== null && out.intCover < 3) || (ebitda !== null && ebitda <= 0));
   if (out.highDebt) out.notes.push('High debt: ' + (out.ndEbitda !== null ? 'net debt ' + out.ndEbitda.toFixed(1) + 'x EBITDA' : 'net debt with no operating profit') +
     (out.intCover !== null ? ', interest cover ' + out.intCover.toFixed(1) + 'x' : ''));
+  // Quality: how profitable the business is and how it treats its shareholders. A gate for the portfolio rules
+  // (ROIC 15%+ and positive free cash flow; return on equity 10%+ for financials, 8%+ for utilities) and a
+  // 0-100% score for position sizing (returns on capital, cash generation, share count change, debt).
+  var roeQ = ni !== null && equity !== null && equity > 0 ? ni / equity : null;
+  var finLike = type === 'Financial' || type === 'Utility';
+  var retQ = finLike ? roeQ : out.roic, retGate = type === 'Financial' ? 0.10 : type === 'Utility' ? 0.08 : 0.15;
+  var capLight = !finLike && out.roic === null && opInc !== null && opInc > 0 && ic <= 0;   // no net capital employed
+  var qParts = [];
+  if (capLight) qParts.push(1);
+  else if (retQ !== null) qParts.push(clamp_((retQ - retGate / 2) / (retGate * 1.5), 0, 1));
+  if (!finLike && out.fcfCashMargin !== null) qParts.push(clamp_(out.fcfCashMargin / 0.2, 0, 1));
+  if (out.dilution !== null && out.dilution !== undefined) qParts.push(clamp_((0.03 - out.dilution) / 0.06, 0, 1));
+  if (!finLike && out.ndEbitda !== null) qParts.push(clamp_((3.5 - out.ndEbitda) / 2.5, 0, 1));
+  out.quality = qParts.length >= 2 ? mean_(qParts) : null;
+  var retOK = capLight || (retQ !== null && retQ >= retGate);
+  var cashOK = finLike || (out.fcfCashMargin !== null && out.fcfCashMargin > 0);
+  out.qualityOK = type !== 'Pre-profit' && retOK && cashOK;
+  out.qualityGate = out.qualityOK ? 'Pass' : 'Fail: ' + [type === 'Pre-profit' ? 'loss-making' : '',
+    retOK || type === 'Pre-profit' ? '' : (finLike ? 'return on equity ' : 'ROIC ') + (retQ === null ? 'n/a' : Math.round(retQ * 100) + '%') + ' (needs ' + Math.round(retGate * 100) + '%+)',
+    cashOK ? '' : 'free cash flow negative'].filter(String).join(', ');
+  // Price against the company's own history: today's P/E and P/S versus their median at each of the last five
+  // annual reports (from the data job; adjusted here for the price move since the data was pulled).
+  var pxAdj = price && n_(raw['Yahoo price']) > 0 ? price / n_(raw['Yahoo price']) : 1;
+  if (pxAdj < 0.5 || pxAdj > 2) pxAdj = 1;
+  var hv = function (nowK, medK) { var a = n_(raw[nowK]), b = n_(raw[medK]); return a > 0 && b > 0 ? a * pxAdj / b - 1 : null; };
+  out.peVsHist = hv('Hist P/E now', 'Hist P/E median'); out.psVsHist = hv('Hist P/S now', 'Hist P/S median');
 
   // Direction signals: true = improving, false = worsening, null = not available
   var sig = out.signals;
@@ -1609,6 +1682,8 @@ var CALC_COLS = [
   ['Setup', '@', 'setup'], ['Setup strength (of 7)', '0', 'setupScore'], ['Setup checks', '@', 'setupChecks'], ['Setup rank', '0', 'setupRank'],
   ['Action', '@', 'action'], ['Target weight', '0.0%', 'targetW'], ['Weight now', '0.0%', 'weightNow'], ['Order (£)', '£#,##0;[Red]-£#,##0', 'orderGBP'],
   ['Action reason', '@', 'actionWhy'],
+  ['Quality', '0%', 'quality'], ['Quality gate', '@', 'qualityGate'], ['Confidence', '@', 'confidence'],
+  ['P/E vs own 5-yr median', '+0%;-0%', 'peVsHist'], ['P/S vs own 5-yr median', '+0%;-0%', 'psVsHist'], ['Payout yield', '0.0%', 'payoutYield'],
   ['12m price change', '+0%;[Red]-0%', 'mom12'], ['Price vs 200-day average', '+0%;[Red]-0%', 'vs200'],
   ['Sort key', '0.000', 'F:sort']
 ];
@@ -1689,6 +1764,7 @@ function recalcValuations() {
       v = valueCompany(rw, m, rate, { type: r[4], growth: r[5], margin: r[6] }, S, hist[t] || null, today);
     } catch (e) { v = { type: 'Error', notes: [e.message], models: {}, signals: {} }; }
     v.sector = rw.Sector || '';
+    v.splitDate = String(rw['Last split date'] || '').slice(0, 10); v.splitRatio = Number(rw['Last split ratio']) || null;
     v.industry = rw['Yahoo industry'] || (rw.Industry ? String(rw.Industry).toLowerCase().replace(/(^|[\s&-])\w/g, function (x) { return x.toUpperCase(); }) : '');
     v.ticker = t; v.name = m.name || rw['SEC name'] || ''; v.list = held[t] ? 'Holding' : 'Watchlist'; v.ccy = m.currency || '';
     v.dirText = v.scoreOf ? v.score + '/' + v.scoreOf : '';
@@ -1722,6 +1798,7 @@ function recalcValuations() {
   try { writeOrders_(orders); } catch (e) { log_('', 'Orders tab: ' + e.message); }
 
   snapshotHistory_(out, today);
+  try { writeScorecard_(out, market, today); } catch (e) { log_('', 'Scorecard: ' + e.message); }
 }
 
 function assumptionsMap_() {
@@ -1764,7 +1841,7 @@ function fxRates_(pairs) {
 
 /** History: weekly snapshot per ticker. Setup and analyst columns let the setups be tested later on real outcomes. */
 var HIST_COLS = ['Date', 'Ticker', 'Price', 'Fair value', 'Direction score', 'Setup', 'Setup strength', 'Analyst target',
-  'Analysts', 'EPS estimate change 90d', 'Price vs 200-day average', 'Free cash flow margin'];
+  'Analysts', 'EPS estimate change 90d', 'Price vs 200-day average', 'Free cash flow margin', 'Action', 'Quality'];
 function historyIndex_(today) {
   var sh = ensureSheet_(SHEET2.HIST, HIST_COLS);
   var out = {};
@@ -1792,7 +1869,7 @@ function snapshotHistory_(rows, today) {
   var add = rows.filter(function (v) { return v.fv || v.setup; }).map(function (v) {
     var x = function (k) { return v[k] === undefined || v[k] === null || (typeof v[k] === 'number' && !isFinite(v[k])) ? '' : v[k]; };
     return [now, v.ticker, typeof mk[v.ticker] === 'number' ? mk[v.ticker] : '', v.fv, x('score'), x('setup'), x('setupScore'),
-      x('analystTarget'), x('analysts'), x('estChg90'), x('vs200'), x('fcfMargin')];
+      x('analystTarget'), x('analysts'), x('estChg90'), x('vs200'), x('fcfMargin'), x('action'), x('quality')];
   });
   if (add.length) sh.getRange(sh.getLastRow() + 1, 1, add.length, HIST_COLS.length).setValues(add);
 }
@@ -1849,7 +1926,9 @@ var HOLDINGS_COLS = [
   ['Setup', 'Setup', '@', 150], ['Setup checks', 'Setup checks', '@', 420],
   ['Net debt / EBITDA', 'Net debt / EBITDA', '0.0"x"', 80], ['Interest cover', 'Interest cover', '0.0"x"', 75],
   ['Action', 'Action', '@', 70], ['Target weight', 'Target weight', '0.0%', 75], ['Order (£)', 'Order (£)', '£#,##0;[Red]-£#,##0', 80],
-  ['Action reason', 'Action reason', '@', 380]
+  ['Action reason', 'Action reason', '@', 380],
+  ['Quality', 'Quality', '0%', 65], ['Quality gate', 'Quality gate', '@', 200], ['Confidence', 'Confidence', '@', 80],
+  ['P/E vs own 5-yr median', 'P/E vs own 5-yr median', '+0%;-0%', 85], ['P/S vs own 5-yr median', 'P/S vs own 5-yr median', '+0%;-0%', 85]
 ];
 var HOLDINGS_FIRST = 14;
 
@@ -1877,7 +1956,8 @@ var WATCH_COLS = [
   ['Price', 'Price', '#,##0.00'], ['Currency', 'Currency', '@'], ['Fair value', 'Fair value', '#,##0.00'],
   ['Buy below', 'Buy below', '#,##0.00'], ['Upside', 'Upside', '0.0%;[Red]-0.0%'],
   ['Exp. return a year (5 yrs)', 'Exp. 5-yr return (a year)', '0.0%;[Red]-0.0%'], ['Direction', 'Direction', '@'],
-  ['Signal', 'Watch signal', '@'], ['Setup', 'Setup', '@'], ['Action', 'Action', '@'], ['Target weight', 'Target weight', '0.0%'], ['Implied growth', 'Implied growth (reverse DCF)', '0.0%'],
+  ['Signal', 'Watch signal', '@'], ['Setup', 'Setup', '@'], ['Action', 'Action', '@'], ['Target weight', 'Target weight', '0.0%'],
+  ['Quality', 'Quality', '0%'], ['Confidence', 'Confidence', '@'], ['P/E vs own 5-yr median', 'P/E vs own 5-yr median', '+0%;-0%'], ['Implied growth', 'Implied growth (reverse DCF)', '0.0%'],
   ['Cash runway (months)', 'Cash runway (months)', '0'], ['Dilution 1-yr', 'Dilution 1-yr', '0.0%;[Red]-0.0%'],
   ['Net debt / EBITDA', 'Net debt / EBITDA', '0.0"x"'], ['Interest cover', 'Interest cover', '0.0"x"'],
   ['Analyst target', 'Analyst target', '#,##0.00'], ['PEG', 'PEG', '0.00'],
@@ -1914,6 +1994,7 @@ var SETUP_COLS = [
   ['Analyst target upside', 'Analyst target upside', '+0%;[Red]-0%', 80], ['Analysts', 'Analysts', '0', 65],
   ['Direction', 'Direction', '@', 70], ['Implied growth', 'Implied growth (reverse DCF)', '0.0%', 80],
   ['Revenue growth 1-yr', 'Revenue growth 1-yr', '0.0%;[Red]-0.0%', 80], ['ROIC', 'ROIC', '0.0%;[Red]-0.0%', 70],
+  ['Quality', 'Quality', '0%', 65], ['Confidence', 'Confidence', '@', 80], ['P/E vs own 5-yr median', 'P/E vs own 5-yr median', '+0%;-0%', 85],
   ['EPS est. change 90d', 'EPS estimate change 90d', '+0.0%;[Red]-0.0%', 80], ['12m price change', '12m price change', '+0%;[Red]-0%', 80],
   ['Price vs 200-day avg', 'Price vs 200-day average', '+0%;[Red]-0%', 80], ['Strength (of 7)', 'Setup strength (of 7)', '0', 70],
   ['Checks', 'Setup checks', '@', 470]
@@ -2036,9 +2117,14 @@ function planPortfolio_(out, market, S, tv) {
   out.forEach(function (v) {
     var sAdj = (v.setupScore || 0) + (v.trendUp === true ? 0 : 1);
     var gp = typeof v.expGap === 'number' ? v.expGap : null;
-    v._q = isBuyType(v) && (v.scorePct || 0) >= 0.75 && sAdj >= 5 && (gp === null || gp <= 0.02);
+    v._rules = isBuyType(v) && (v.scorePct || 0) >= 0.75 && sAdj >= 5 && (gp === null || gp <= 0.02);
+    // Quality gate: ROIC 15%+ and positive free cash flow (return on equity for financials and utilities).
+    v._q = v._rules && v.qualityOK === true;
     if (v._q) {
-      var cv = (clip((sAdj - 5) / 2) + clip(((v.expRet || 0.1) - 0.10) / 0.15) + clip(-(gp || 0) / 0.3) + clip(((v.scorePct || 0) - 0.75) / 0.25)) / 4;
+      // Conviction: quality 30%, setup strength 25%, direction 20%, cheapness 25% (expected return and growth
+      // cushion, half each). In the back-test quality lined up with later returns; cheapness alone did not.
+      var cv = 0.30 * (v.quality === null || v.quality === undefined ? 0.5 : v.quality) + 0.25 * clip((sAdj - 5) / 2) +
+        0.20 * clip(((v.scorePct || 0) - 0.75) / 0.25) + 0.125 * clip(((v.expRet || 0.1) - 0.10) / 0.15) + 0.125 * clip(-(gp || 0) / 0.3);
       v._t = (v.deepCyclical ? P.maxCyc : P.maxBest) * (0.4 + 0.6 * cv);
       sumQ += v._t;
     } else if (v.valueNow > 0) heldOther += v.weightNow;
@@ -2068,7 +2154,7 @@ function planPortfolio_(out, market, S, tv) {
     var why = [];
     if (qualifies) {
       v.targetW = v._t * scale;
-      why.push(v.setup + ', strength ' + v.setupScore + '/7, direction ' + Math.round((v.scorePct || 0) * 100) + '%');
+      why.push(v.setup + ', quality ' + (v.quality === null || v.quality === undefined ? 'n/a' : Math.round(v.quality * 100) + '%') + ', strength ' + v.setupScore + '/7, direction ' + Math.round((v.scorePct || 0) * 100) + '%');
     } else if (held) {
       v.targetW = v.speculative || v.thinTargets || v.type === 'Pre-profit' ? Math.min(v.weightNow, P.maxSpec) : v.weightNow;
     }
@@ -2113,8 +2199,8 @@ function planPortfolio_(out, market, S, tv) {
       return;
     }
     if (v._ranked !== undefined) { v.action = held ? 'Hold' : 'Wait'; v.actionWhy = 'Qualifies, but ranks below the ' + v._ranked + ' strongest that fit the portfolio at ' + Math.round(P.minPos * 100) + '%+ each'; return; }
-    if (held && !v.action) { v.action = 'Hold'; v.actionWhy = qualifies ? 'At target' : (v.setup ? v.setup + ': no adds' : 'Does not qualify for adds'); }
-    else if (!held && buyType && !qualifies) { v.action = 'Watch'; v.actionWhy = 'Setup but not all rules: ' + [(v.scorePct || 0) < 0.75 ? 'direction under 75%' : '', strengthAdj < 5 ? 'strength under 5' : '', gap !== null && gap > 0.02 ? 'priced for more growth than expected' : ''].filter(String).join(', '); }
+    if (held && !v.action) { v.action = 'Hold'; v.actionWhy = qualifies ? 'At target' : v._rules && !v.qualityOK ? 'No adds: quality gate (' + String(v.qualityGate || '').replace('Fail: ', '') + ')' : (v.setup ? v.setup + ': no adds' : 'Does not qualify for adds'); }
+    else if (!held && buyType && !qualifies) { v.action = 'Watch'; v.actionWhy = 'Setup but not all rules: ' + [(v.scorePct || 0) < 0.75 ? 'direction under 75%' : '', strengthAdj < 5 ? 'strength under 5' : '', gap !== null && gap > 0.02 ? 'priced for more growth than expected' : '', v._rules && !v.qualityOK ? 'quality gate (' + String(v.qualityGate || '').replace('Fail: ', '') + ')' : ''].filter(String).join(', '); }
   });
   // Allocate cash to buys, strongest first, within the reserve and industry caps.
   // Only cash already in the account is spent: money from trims and sales counts once they are ticked Done
@@ -2260,10 +2346,10 @@ function executeOrder_(row) {
 
 var RULES_TEXT = [
   ['How the rules work', ''],
-  ['1. Gate', 'Only stocks whose business is improving qualify: Direction 75% or higher.'],
+  ['1. Gate', 'Only good businesses that are improving qualify: Direction 75% or higher, and the quality gate (ROIC 15%+ and positive free cash flow; return on equity 10%+ for financials, 8%+ for utilities).'],
   ['2. Rank', 'Buy-type setup (Value setup, Compounder, Quality pullback) with Strength 5+ out of 7. A missing Trend point is not held against it.'],
   ['3. Confirm', 'Forecasts must not be falling (built into the setups) and the price must need no more growth than expected (Expectations gap 2% or lower).'],
-  ['4. Size', 'Stand-alone target = best-ideas cap x (40% + 60% x conviction). Conviction blends Strength, expected return, the expectations cushion and Direction. Cyclicals use the lower cyclical cap. When many stocks qualify, targets are scaled down together so they fit in the portfolio (after the cash reserve and the holdings that do not qualify); if that would make positions smaller than the minimum position, only the strongest qualifiers are kept.'],
+  ['4. Size', 'Stand-alone target = best-ideas cap x (40% + 60% x conviction). Conviction is 30% Quality (returns on capital, cash generation, share count, debt), 25% Strength, 20% Direction and 25% cheapness (expected return and the expectations cushion). Cyclicals use the lower cyclical cap. When many stocks qualify, targets are scaled down together so they fit in the portfolio (after the cash reserve and the holdings that do not qualify); if that would make positions smaller than the minimum position, only the strongest qualifiers are kept.'],
   ['5. Buy', 'Above the 200-day average: buy the full target. Below it: buy a third now, the next third after the set number of days or on a further 10% fall.'],
   ['6. Cash', 'Money goes to qualifying stocks, strongest first, keeping the cash reserve and the per-industry cap. A pace limit spreads it over weeks: at most the set share of cash, and the set number of new positions, in any 7 days. Anything left stays in cash until the next opportunity.'],
   ['7. Warnings', 'Value, estimates falling / Trend broken / High debt / Cash burner on a holding: halve it, then sell the rest if the warning lasts the set number of weeks.'],
@@ -2274,7 +2360,7 @@ var RULES_TEXT = [
   ['', ''],
   ['Actions', 'Buy / Add: place the order shown. Trim / Sell: reduce as shown. Hold: nothing to do. Wait: qualifies but waiting (next third not due, industry cap, or no cash). Watch: a setup that misses a rule.'],
   ['', ''],
-  ['Limits of the rules', 'The cash-burner veto is the only rule proven in the back-test (2023-26, your own trades). The setups have not yet been tested on outcomes: the History tab is recording them weekly so they can be. The rules decide; they cannot know news the data has not caught.']
+  ['Limits of the rules', 'In the back-test (2023-26, your own trades) the cash-burner veto and quality (return on capital, cash generation, a steady share count) lined up with later returns; cheapness on its own did not. The setups themselves have not yet been tested on outcomes: the Scorecard tab tracks every stock from the week it is flagged. The rules decide; they cannot know news the data has not caught.']
 ];
 function writeRulesTab_() {
   var sh = ensureSheet_(ORDERS.RULES, ['Rule', 'What it does']);
@@ -2282,6 +2368,120 @@ function writeRulesTab_() {
   sh.getRange(1, 1, 1, 2).setFontWeight('bold').setFontColor('#FFFFFF').setBackground('#1F3A5F');
   sh.getRange(2, 1, RULES_TEXT.length - 1, 1).setFontWeight('bold');
   sh.setColumnWidth(1, 170); sh.setColumnWidth(2, 760);
+}
+
+
+/* ======================================================================== */
+/*  SCORECARD: how flagged stocks have done since                            */
+/* ======================================================================== */
+/* Built from the weekly History snapshots. A stock is counted from the first snapshot at which it carried a
+   setup (again if it leaves and returns), and its price change since is compared with the S&P 500 (SPY) over the
+   same days. Prices before a share split are adjusted. Returns are in each stock's own currency; the benchmark
+   is in dollars. */
+var SCORE = { NAME: 'Scorecard', BENCH: 'Benchmark' };
+var SCORE_ORDER = ['Orders: Buy / Add', 'Value setup', 'Compounder', 'Quality pullback', 'Value, estimates falling', 'Trend broken',
+  'High debt', 'Thin targets', 'Cash burner', 'No setup'];
+
+/** Daily S&P 500 (SPY) closes from data/benchmark.csv (written by the GitHub job). */
+function loadBenchmark_(rawUrl) {
+  try {
+    var url = rawUrl.replace(/raw_data\.csv.*$/, 'benchmark.csv');
+    var res = UrlFetchApp.fetch(url + '?t=' + Date.now(), { muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) return;
+    var rows = Utilities.parseCsv(res.getContentText()).filter(function (r) { return r.length >= 2 && r[0]; });
+    if (rows.length < 2) return;
+    var sh = ensureSheet_(SCORE.BENCH, ['Date', 'S&P 500 (SPY) close']);
+    if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, 2).clearContent();
+    var body = rows.slice(1).map(function (r) { return [String(r[0]), Number(r[1])]; });
+    sh.getRange(2, 1, body.length, 2).setNumberFormat('@').setValues(body);
+  } catch (e) { log_('', 'Could not load the benchmark: ' + e.message); }
+}
+
+function writeScorecard_(out, market, today) {
+  var ss = SpreadsheetApp.getActive();
+  var hs = ss.getSheetByName(SHEET2.HIST);
+  var heads = ['Group', 'Stocks flagged', 'Avg weeks since', 'Avg return', 'S&P 500, same period', 'Avg vs S&P 500', 'Beat the S&P 500',
+    'Flagged 4+ weeks ago', 'Avg vs S&P 500 (4+ weeks)', 'Beat the S&P 500 (4+ weeks)'];
+  var sh = ensureSheet_(SCORE.NAME, heads);
+  sh.getRange(1, 1, 1, heads.length).setFontColor('#FFFFFF').setBackground('#1F3A5F').setWrap(true);
+  if (sh.getMaxRows() > 1) sh.getRange(2, 1, sh.getMaxRows() - 1, 12).clearContent();
+  var note = function (t) { sh.getRange(2, 1).setValue(t); };
+  if (!hs || hs.getLastRow() < 2) return note('No History snapshots yet: the first is taken on the next refresh.');
+  // Benchmark closes
+  var bs = ss.getSheetByName(SCORE.BENCH), bDates = [], bVals = [];
+  if (bs && bs.getLastRow() > 1) bs.getRange(2, 1, bs.getLastRow() - 1, 2).getValues().forEach(function (r) {
+    var d = r[0] instanceof Date ? Utilities.formatDate(r[0], 'UTC', 'yyyy-MM-dd') : String(r[0]).slice(0, 10);
+    if (d && Number(r[1]) > 0) { bDates.push(d); bVals.push(Number(r[1])); }
+  });
+  var benchAt = function (d) { var v = null; for (var i = 0; i < bDates.length; i++) { if (bDates[i] <= d) v = bVals[i]; else break; } return v; };
+  var benchNow = bVals.length ? bVals[bVals.length - 1] : null;
+  // Snapshots
+  var nc = Math.min(hs.getLastColumn(), HIST_COLS.length);
+  var H = hs.getRange(2, 1, hs.getLastRow() - 1, nc).getValues();
+  var byDate = {}, byT = {};
+  H.forEach(function (r) {
+    var d = r[0] instanceof Date ? Utilities.formatDate(r[0], 'UTC', 'yyyy-MM-dd') : String(r[0]).slice(0, 10);
+    var t = String(r[1]).toUpperCase(); if (!d || !t) return;
+    var rec = { d: d, t: t, price: Number(r[2]) || null, setup: String(r[5] || ''), action: String(r[12] || '') };
+    (byDate[d] = byDate[d] || []).push(rec); (byT[t] = byT[t] || []).push(rec);
+  });
+  // Snapshots taken before setups were recorded carry none at all: leave those dates out.
+  var okDate = {};
+  Object.keys(byDate).forEach(function (d) { okDate[d] = byDate[d].some(function (x) { return x.setup; }); });
+  var now = {}; out.forEach(function (v) { now[v.ticker] = v; });
+  var todayStr = Utilities.formatDate(new Date(), 'UTC', 'yyyy-MM-dd');
+  var entries = [];
+  Object.keys(byT).forEach(function (t) {
+    var v = now[t], m = market[t] || {};
+    var pNow = typeof m.price === 'number' && m.price > 0 ? m.price : null;
+    if (!v || !pNow) return;
+    var prevSetup, prevOrder = false;
+    byT[t].sort(function (a, b) { return a.d < b.d ? -1 : 1; }).forEach(function (x) {
+      if (!okDate[x.d] || !x.price) return;
+      var p0 = x.price;
+      if (v.splitRatio > 0 && v.splitDate && x.d < v.splitDate) p0 = p0 / v.splitRatio;   // later share split
+      var b0 = benchAt(x.d);
+      var mk = function (group) {
+        var ret = pNow / p0 - 1, bret = b0 && benchNow ? benchNow / b0 - 1 : null;
+        if (ret > 9 || ret < -0.98) return;   // price not comparable (unrecorded split or bad quote)
+        entries.push({ group: group, t: t, d: x.d, p0: p0, p1: pNow, ret: ret, bret: bret, ex: bret === null ? null : ret - bret,
+          weeks: (dnum_(todayStr) - dnum_(x.d)) / 7, nowSetup: v.setup || 'No setup' });
+      };
+      var su = x.setup || 'No setup';
+      if (su !== prevSetup) mk(su);
+      prevSetup = su;
+      var ord = x.action === 'Buy' || x.action === 'Add';
+      if (ord && !prevOrder) mk('Orders: Buy / Add');
+      prevOrder = ord;
+    });
+  });
+  if (!entries.length) return note('No snapshots with setups yet: the first appears within a week.');
+  var avg = function (a) { a = a.filter(function (x) { return x !== null && isFinite(x); }); return a.length ? a.reduce(function (p, c) { return p + c; }, 0) / a.length : ''; };
+  var share = function (a) { a = a.filter(function (x) { return x.ex !== null; }); return a.length ? a.filter(function (x) { return x.ex > 0; }).length / a.length : ''; };
+  var groups = SCORE_ORDER.filter(function (g) { return entries.some(function (e) { return e.group === g; }); });
+  var rows = groups.map(function (g) {
+    var a = entries.filter(function (e) { return e.group === g; }), old = a.filter(function (e) { return e.weeks >= 4; });
+    return [g, a.length, avg(a.map(function (e) { return e.weeks; })), avg(a.map(function (e) { return e.ret; })), avg(a.map(function (e) { return e.bret; })),
+      avg(a.map(function (e) { return e.ex; })), share(a), old.length, avg(old.map(function (e) { return e.ex; })), share(old)];
+  });
+  sh.getRange(2, 1, rows.length, heads.length).setValues(rows);
+  sh.getRange(2, 3, rows.length, 1).setNumberFormat('0.0');
+  sh.getRange(2, 4, rows.length, 4).setNumberFormat('+0.0%;[Red]-0.0%');
+  sh.getRange(2, 7, rows.length, 1).setNumberFormat('0%');
+  sh.getRange(2, 9, rows.length, 1).setNumberFormat('+0.0%;[Red]-0.0%');
+  sh.getRange(2, 10, rows.length, 1).setNumberFormat('0%');
+  var r0 = rows.length + 3;
+  sh.getRange(r0, 1).setValue('How to read this: each stock is counted from the first weekly snapshot at which it was flagged, and its price change since is set against the S&P 500 over the same days (own currency vs dollars). A few weeks prove nothing: judge a setup once it has 20+ stocks flagged at least 3 months ago.' +
+    (benchNow ? '' : ' S&P 500 data has not loaded yet (it arrives with the next data update).'));
+  var dh = ['Group', 'Ticker', 'Flagged on', 'Price then', 'Price now', 'Return', 'S&P 500', 'vs S&P 500', 'Weeks', 'Setup now'];
+  sh.getRange(r0 + 2, 1, 1, dh.length).setValues([dh]).setFontWeight('bold').setBackground('#F1EFE8');
+  entries.sort(function (a, b) { return SCORE_ORDER.indexOf(a.group) - SCORE_ORDER.indexOf(b.group) || (a.d < b.d ? -1 : a.d > b.d ? 1 : 0) || (a.t < b.t ? -1 : 1); });
+  var det = entries.slice(0, 3000).map(function (e) { return [e.group, e.t, e.d, e.p0, e.p1, e.ret, e.bret === null ? '' : e.bret, e.ex === null ? '' : e.ex, e.weeks, e.nowSetup]; });
+  sh.getRange(r0 + 3, 1, det.length, dh.length).setValues(det);
+  sh.getRange(r0 + 3, 4, det.length, 2).setNumberFormat('#,##0.00');
+  sh.getRange(r0 + 3, 6, det.length, 3).setNumberFormat('+0.0%;[Red]-0.0%');
+  sh.getRange(r0 + 3, 9, det.length, 1).setNumberFormat('0.0');
+  [190, 80, 95, 90, 90, 95, 95, 95, 95, 170].forEach(function (w, i) { sh.setColumnWidth(i + 1, w); });
 }
 
 /** Colours for Status and Signal columns (replaces earlier rules on these tabs). */
@@ -2350,7 +2550,8 @@ function buildStockView_() {
   sh.getRange('M3:O3').merge().getCell(1, 1).setFormula('="Data as of "&' + svLook_(SHEET2.CALC, 'Data as of')).setFontColor('#888780').setFontSize(9);
 
   sh.getRange('D4:R4').merge().getCell(1, 1).setFormula('=IF(' + svLook_(SHEET2.CALC, 'Setup') + '="","No setup.   ","Setup: "&' + svLook_(SHEET2.CALC, 'Setup') + '&"   ")&' +
-    svLook_(SHEET2.CALC, 'Setup checks')).setFontWeight('bold').setFontColor('#1F3A5F');
+    svLook_(SHEET2.CALC, 'Setup checks') + '&IFERROR("   |   Quality "&TEXT(' + svLook_(SHEET2.CALC, 'Quality') + ',"0%")&" ("&' + svLook_(SHEET2.CALC, 'Quality gate') +
+    '&")   Confidence: "&' + svLook_(SHEET2.CALC, 'Confidence') + ',"")').setFontWeight('bold').setFontColor('#1F3A5F');
 
   // Metric cards
   var cards = [['Fair value', 'Fair value', '#,##0.00'], ['Upside', 'Upside', '+0%;[Red]-0%'],

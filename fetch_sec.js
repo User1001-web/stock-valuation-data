@@ -335,7 +335,7 @@ async function addYahoo(rows, tickers) {
   try { yf = await yahoo(); } catch (e) { console.log('Yahoo library not available: ' + e.message); return; }
   const market = {};
   tickers.forEach(t => { market[t.ticker] = t.market; });
-  let ok = 0, fail = 0;
+  let ok = 0, fail = 0, histOk = 0, histFail = 0;
   for (const r of rows) {
     const m = market[r.Ticker] || 'US';
     if (m === 'ETF') continue;
@@ -357,6 +357,22 @@ async function addYahoo(rows, tickers) {
       const hist = ((q.earningsHistory && q.earningsHistory.history) || []).filter(h => h.quarter && typeof h.surprisePercent === 'number')
         .sort((a, b) => new Date(b.quarter) - new Date(a.quarter));
       if (hist.length) { r['Last EPS surprise'] = hist[0].surprisePercent; r['Last earnings quarter'] = new Date(hist[0].quarter).toISOString().slice(0, 10); }
+      // Adjusted EPS actually reported over the last four quarters: the basis analysts forecast on. The sheet
+      // compares it with reported EPS to scale analysts' forecasts.
+      const h4 = ((q.earningsHistory && q.earningsHistory.history) || []).filter(h => h.quarter && typeof h.epsActual === 'number')
+        .sort((a, b) => new Date(b.quarter) - new Date(a.quarter)).slice(0, 4);
+      if (h4.length === 4) {
+        const span = (new Date(h4[0].quarter) - new Date(h4[3].quarter)) / 864e5;
+        if (span > 240 && span < 310) r['Adj EPS TTM'] = h4.reduce((a, h) => a + h.epsActual, 0);
+      }
+      const betaY = typeof sd.beta === 'number' ? sd.beta : ks.beta;
+      if (typeof betaY === 'number' && isFinite(betaY)) r.Beta = betaY;
+      // Latest share split (so the sheet's Scorecard can compare prices across it)
+      const sf = /^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/.exec(String(ks.lastSplitFactor || ''));
+      if (sf && ks.lastSplitDate) {
+        const sdte = typeof ks.lastSplitDate === 'number' ? new Date(ks.lastSplitDate < 1e11 ? ks.lastSplitDate * 1000 : ks.lastSplitDate) : new Date(ks.lastSplitDate);
+        if (!isNaN(sdte) && +sf[2] > 0) { r['Last split date'] = sdte.toISOString().slice(0, 10); r['Last split ratio'] = +sf[1] / +sf[2]; }
+      }
       const trend = ((q.earningsTrend && q.earningsTrend.trend) || []).find(t => t.period === '+1y') || {};
       const et = trend.epsTrend || {}, er = trend.epsRevisions || {};
       if (typeof et.current === 'number') {
@@ -389,8 +405,70 @@ async function addYahoo(rows, tickers) {
       ok++;
     } catch (e) { fail++; }
     await sleep(400);
+    if (m === 'US' && /^\d+$/.test(String(r.CIK || ''))) {
+      try { if (await ownHistory(yf, r, sym)) histOk++; } catch (e) { histFail++; }
+      await sleep(300);
+    }
   }
   console.log(`Yahoo: ${ok} answered, ${fail} failed`);
+  console.log(`Own valuation history: ${histOk} computed, ${histFail} failed`);
+  // S&P 500 (SPY) daily closes for the sheet's Scorecard.
+  try {
+    const c = await yf.chart('SPY', { period1: new Date(Date.now() - 800 * 864e5), interval: '1d' });
+    const lines = ['date,close'].concat((c.quotes || []).filter(x => x.close > 0).map(x => new Date(x.date).toISOString().slice(0, 10) + ',' + x.close.toFixed(2)));
+    if (lines.length > 50) { fs.mkdirSync(OUT_DIR, { recursive: true }); fs.writeFileSync(path.join(OUT_DIR, 'benchmark.csv'), lines.join('\n') + '\n'); console.log(`Benchmark: ${lines.length - 1} days of SPY`); }
+  } catch (e) { console.log('Could not fetch the benchmark: ' + e.message); }
+}
+
+// Price against the company's own history. Market value at each of the last six annual reports = the diluted
+// share count as first reported x the share price on the day it was filed (both on that day's share basis, so
+// later splits do not distort it), set against that year's revenue and net income; then the same ratios today.
+async function ownHistory(yf, r, sym) {
+  const file = path.join(OUT_DIR, 'facts', r.Ticker + '.json');
+  const fy0 = r['Latest FY end'];
+  if (!fy0 || !fs.existsSync(file)) return false;
+  const facts = JSON.parse(fs.readFileSync(file, 'utf8')).facts || {};
+  let series = [];
+  for (const ns of Object.keys(TAGS)) {
+    for (const tag of [].concat(TAGS[ns].DilutedShares || []).flat()) {
+      const u = ((facts[ns] || {})[tag] || {}).units || {};
+      const arr = (u.shares || []).filter(f => f.start && f.filed && f.val > 0);
+      if (arr.length) { series = arr; break; }
+    }
+    if (series.length) break;
+  }
+  if (!series.length) return false;
+  const c = await yf.chart(sym, { period1: new Date(Date.now() - 2500 * 864e5), interval: '1wk', events: 'split' });
+  const quotes = (c.quotes || []).filter(x => x.close > 0).map(x => ({ d: new Date(x.date).toISOString().slice(0, 10), close: x.close }));
+  if (quotes.length < 60) return false;
+  const splits = ((c.events && c.events.splits) || []).map(x => ({ d: new Date(x.date).toISOString().slice(0, 10), ratio: x.numerator / x.denominator }))
+    .filter(x => x.ratio > 0 && isFinite(x.ratio));
+  const after = d => splits.filter(x => x.d > d).reduce((a, x) => a * x.ratio, 1);   // splits since that day
+  const closeOn = d => { let v = null; for (const x of quotes) { if (x.d <= d) v = x; else break; } return v && (Date.parse(d) - Date.parse(v.d)) / 864e5 <= 14 ? v.close : null; };
+  const days = (a, b) => (Date.parse(a) - Date.parse(b)) / 864e5;
+  const ps = [], pe = [];
+  for (let k = 0; k <= 5; k++) {
+    const target = new Date(Date.parse(fy0) - k * 365.25 * 864e5).toISOString().slice(0, 10);
+    const cands = series.filter(f => { const len = days(f.end, f.start); return len >= 350 && len <= 380 && Math.abs(days(f.end, target)) <= 12; })
+      .sort((a, b) => (a.filed < b.filed ? -1 : 1));
+    if (!cands.length) continue;
+    const first = cands[0], px = closeOn(first.filed);
+    if (!px || days(first.filed, first.end) > 200) continue;
+    const mcap = first.val * px * after(first.filed);   // unadjusted price on the filing date x shares as filed
+    const sfx = ' FY' + (k === 0 ? '0' : '-' + k), rev = Number(r['Revenue' + sfx]), ni = Number(r['NetIncome' + sfx]);
+    if (rev > 0) ps.push(mcap / rev);
+    if (rev > 0 && ni > 0 && mcap / ni <= 150) pe.push(mcap / ni);
+  }
+  const med = a => { a = a.slice().sort((x, y) => x - y); const n = a.length; return n % 2 ? a[(n - 1) / 2] : (a[n / 2 - 1] + a[n / 2]) / 2; };
+  const basis = series.reduce((a, f) => (f.filed > a ? f.filed : a), '');
+  const yahooShares = /Latest 12 months from Yahoo/.test(r.Notes || '');
+  const sharesNow = Number(r['Diluted shares latest']) * (yahooShares ? 1 : after(basis));
+  const mcapNow = sharesNow * quotes[quotes.length - 1].close;
+  const revT = Number(r['Revenue TTM']), niT = Number(r['NetIncome TTM']);
+  if (!(mcapNow > 0)) return false;
+  if (ps.length >= 3 && revT > 0) { r['Hist P/S now'] = mcapNow / revT; r['Hist P/S median'] = med(ps); r['Hist years'] = ps.length; }
+  if (pe.length >= 3 && niT > 0) { r['Hist P/E now'] = mcapNow / niT; r['Hist P/E median'] = med(pe); }
+  return ps.length >= 3;
 }
 
 // Analyst estimates and price targets from Financial Modeling Prep (free key, limited coverage).
