@@ -175,7 +175,7 @@ function onEdit(e) {
     if (name === SV.NAME) {
       var a1 = e.range.getA1Notation();
       if (a1 === SV.TICKER) renderStockView_();
-      else if (a1 === SV.NOTE_CELL || a1 === SV.NOTE_RANGE) saveNote_(String(e.range.getSheet().getRange(SV.TICKER).getValue()).trim().toUpperCase(), e.range.getValue());
+      else if (a1 === SV.NOTE_CELL || a1 === SV.NOTE_RANGE) saveNote_(svTicker_(e.range.getSheet()), e.range.getValue());
     }
   } catch (err) { /* never block an edit */ }
 }
@@ -1582,6 +1582,13 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
    Value, estimates falling - cheap, but analysts are cutting forecasts (the classic value-trap pattern).
    Trend broken - a quality grower that is not cheap, with the price falling and estimates no longer rising.
    Thin targets - big analyst upside resting on few analysts or a very wide range of targets. */
+// Coloured marker shown beside the ticker in the Stock view picker (Google Sheets cannot colour the list
+// items themselves from a formula, so the colour travels in the text).
+var SETUP_MARK = { 'Value setup': '\uD83D\uDFE2', 'Compounder': '\uD83D\uDD35', 'Quality pullback': '\uD83D\uDFE3',
+  'Value, estimates falling': '\uD83D\uDFE1', 'Trend broken': '\uD83D\uDD34', 'High debt': '\uD83D\uDFE0',
+  'Thin targets': '\u26AA', 'Cash burner': '\u26D4' };
+var SETUP_LEGEND = 'Stock picker\n\n\uD83D\uDFE2 Value setup\n\uD83D\uDD35 Compounder\n\uD83D\uDFE3 Quality pullback\n' +
+  '\uD83D\uDFE1 Value, estimates falling\n\uD83D\uDD34 Trend broken\n\uD83D\uDFE0 High debt\n\u26AA Thin targets\n\u26D4 Cash burner\n(no mark) no setup';
 var SETUP_RANK = { 'Value setup': 1, 'Compounder': 2, 'Quality pullback': 3, 'Value, estimates falling': 4, 'Trend broken': 5, 'High debt': 6, 'Thin targets': 7, 'Cash burner': 8 };
 function setupFor_(out, raw, price, eps, type, S) {
   out.setup = ''; out.setupScore = null; out.setupChecks = ''; out.setupRank = '';
@@ -1681,7 +1688,7 @@ var CALC_COLS = [
   ['Next earnings', '@', 'nextEarnings'], ['Last EPS surprise', '+0.0%;[Red]-0.0%', 'surprise'],
   ['EPS estimate change 30d', '+0.0%;[Red]-0.0%', 'estChg30'], ['EPS estimate change 90d', '+0.0%;[Red]-0.0%', 'estChg90'],
   ['Analyst revisions 30d', '@', 'revisionsText'],
-  ['Setup', '@', 'setup'], ['Setup strength (of 7)', '0', 'setupScore'], ['Setup checks', '@', 'setupChecks'], ['Setup rank', '0', 'setupRank'],
+  ['Setup', '@', 'setup'], ['Setup strength (of 7)', '0', 'setupScore'], ['Setup checks', '@', 'setupChecks'], ['Setup rank', '0', 'setupRank'], ['Pick label', '@', 'pickLabel'],
   ['Action', '@', 'action'], ['Target weight', '0.0%', 'targetW'], ['Weight now', '0.0%', 'weightNow'], ['Order (£)', '£#,##0;[Red]-£#,##0', 'orderGBP'],
   ['Action reason', '@', 'actionWhy'],
   ['Quality', '0%', 'quality'], ['Quality gate', '@', 'qualityGate'], ['Confidence', '@', 'confidence'],
@@ -1784,6 +1791,8 @@ function recalcValuations() {
   if (!out.length) return;
   // Alphabetical, so the Stock view dropdown (which lists Calc tickers) is easy to search.
   out.sort(function (a, b) { return a.ticker < b.ticker ? -1 : a.ticker > b.ticker ? 1 : 0; });
+  // Label for the Stock view picker: the setup's marker, then the ticker.
+  out.forEach(function (v) { var mk = SETUP_MARK[v.setup || '']; v.pickLabel = (mk ? mk + ' ' : '') + v.ticker; });
   var orders = [];
   try { orders = planPortfolio_(out, market, S, tv); } catch (e) { log_('', 'Portfolio rules: ' + e.message); }
   var rows = out.map(function (v, i) {
@@ -2516,12 +2525,43 @@ function writeColourRules_() {
 
 // Layout for a wide (27-inch) screen: three charts per row, about 780 x 330 px each.
 var SV = { NAME: 'Stock view', NOTES: 'Stock notes', TICKER: 'C2', NOTE_CELL: 'R68', NOTE_RANGE: 'R68:X80',
-  GRID_ROW: 49, GRID_COL: 18, HELP_COL: 40, CW: 780, CH: 330 };   // helper data from column AN
+  GRID_ROW: 49, GRID_COL: 18, HELP_COL: 40, CW: 780, CH: 330,   // helper data from column AN
+  CLEAN_ROW: 400, SETUP_ROW: 401 };   // hidden: the ticker without its marker, and that stock's setup
+
+/** The ticker chosen in the picker, without its coloured marker ("\uD83D\uDFE2 NVDA" -> "NVDA"). */
+function svTicker_(sh) {
+  var raw = String(sh.getRange(SV.TICKER).getValue()).trim();
+  return raw ? raw.split(/\s+/).pop().toUpperCase() : '';
+}
+
+/** The picker label for a ticker ("NVDA" -> "\uD83D\uDFE2 NVDA"), read from the Calc tab. */
+function svLabelFor_(t) {
+  var calc = SpreadsheetApp.getActive().getSheetByName(SHEET2.CALC);
+  if (!calc || calc.getLastRow() < 2) return t;
+  var col = CALC_COLS.map(function (c) { return c[0]; }).indexOf('Pick label');
+  if (col < 0) return t;
+  var vals = calc.getRange(2, 1, calc.getLastRow() - 1, col + 1).getValues();
+  for (var i = 0; i < vals.length; i++) if (String(vals[i][0]).trim().toUpperCase() === t) return String(vals[i][col]) || t;
+  return t;
+}
 
 /** Formula that looks up a column (by header) for the selected ticker on another tab. */
 function svLook_(sheet, header) {
   var q = "'" + sheet + "'";
   return 'IFERROR(INDEX(' + q + '!$A$1:$ZZ$2000,MATCH(SV_TICKER,' + q + '!$A$1:$A$2000,0),MATCH("' + header + '",' + q + '!$A$1:$ZZ$1,0)),"")';
+}
+
+/** Colours the picker cell by the chosen stock's setup (that setup sits in a hidden cell on this tab). */
+function svPickerRules_(sh) {
+  var ref = '$' + colL_(SV.HELP_COL) + '$' + SV.SETUP_ROW;
+  var colours = { 'Value setup': '#B7E1CD', 'Compounder': '#C9DAF8', 'Quality pullback': '#D0E0E3',
+    'Value, estimates falling': '#FFF2CC', 'Trend broken': '#F4C7C3', 'High debt': '#F9CB9C',
+    'Thin targets': '#E8EAED', 'Cash burner': '#E6B8AF' };
+  var range = sh.getRange(SV.TICKER);
+  return Object.keys(colours).map(function (k) {
+    return SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=' + ref + '="' + k + '"').setBackground(colours[k]).setRanges([range]).build();
+  });
 }
 
 /** Builds (or rebuilds) the Stock view tab: layout, helper tables and charts. */
@@ -2536,14 +2576,22 @@ function buildStockView_() {
   sh.setHiddenGridlines(true);
   sh.setColumnWidth(1, 16);
   for (var c = 2; c <= 25; c++) sh.setColumnWidth(c, 100);
-  ss.setNamedRange('SV_TICKER', sh.getRange(SV.TICKER));
+  // The picker holds "<marker> TICKER", so the ticker itself is parsed into a hidden cell that every lookup
+  // on this tab points at.
+  sh.getRange(SV.CLEAN_ROW, SV.HELP_COL).setFormula('=IFERROR(UPPER(REGEXEXTRACT(TRIM(' + SV.TICKER + '),"[^\\s]+$")),"")');
+  ss.setNamedRange('SV_TICKER', sh.getRange(SV.CLEAN_ROW, SV.HELP_COL));
+  sh.getRange(SV.SETUP_ROW, SV.HELP_COL).setFormula('=' + svLook_(SHEET2.CALC, 'Setup'));
 
   // Header and selector
   sh.getRange('B2').setValue('Stock').setFontColor('#5F5E5A');
   var calc = ss.getSheetByName(SHEET2.CALC);
-  var rule = SpreadsheetApp.newDataValidation().requireValueInRange(calc.getRange('A2:A2000'), true).setAllowInvalid(false).build();
+  var pickCol = calcL_('Pick label');
+  var src = pickCol ? calc.getRange(pickCol + '2:' + pickCol + '2000') : calc.getRange('A2:A2000');
+  var rule = SpreadsheetApp.newDataValidation().requireValueInRange(src, true).setAllowInvalid(true).build();
+  var start = keep ? svLabelFor_(String(keep).trim().split(/\s+/).pop().toUpperCase())
+    : (calc.getLastRow() > 1 ? src.getCell(1, 1).getValue() : '');
   sh.getRange(SV.TICKER).setDataValidation(rule).setFontWeight('bold').setFontSize(12).setBackground('#FFF4CC')
-    .setValue(keep || (calc.getLastRow() > 1 ? calc.getRange('A2').getValue() : ''));
+    .setNote(SETUP_LEGEND).setValue(start);
   sh.getRange('D2:K2').merge().getCell(1, 1).setFormula('=' + svLook_(SHEET2.CALC, 'Name')).setFontSize(16).setFontWeight('bold');
   sh.getRange('D3:K3').merge().getCell(1, 1).setFormula('=TEXTJOIN("  ·  ",TRUE,' + svLook_(SHEET2.CALC, 'Sector') + ',' + svLook_(SHEET2.CALC, 'Industry') + ',' +
     svLook_(SHEET2.CALC, 'Type') + ',' + svLook_(SHEET2.CALC, 'List') + ',IF(' + svLook_(SHEET2.CALC, 'Currency') + '="","","Prices in "&' + svLook_(SHEET2.CALC, 'Currency') + '))').setFontColor('#5F5E5A');
@@ -2693,14 +2741,14 @@ function buildStockView_() {
   sh.getRange('B67').setFormula('=IFERROR(SPLIT(' + svLook_(SHEET2.CALC, 'Signals') + ',"  ",FALSE),"")');
   sh.getRange('B67:I67').setHorizontalAlignment('center').setFontSize(11);
   var sig = sh.getRange('B67:I67');
-  sh.setConditionalFormatRules([
+  sh.setConditionalFormatRules(svPickerRules_(sh).concat([
     SpreadsheetApp.newConditionalFormatRule().whenTextContains('↑').setBackground('#EAF3DE').setFontColor('#27500A').setRanges([sig]).build(),
     SpreadsheetApp.newConditionalFormatRule().whenTextContains('↓').setBackground('#FCEBEB').setFontColor('#791F1F').setRanges([sig]).build(),
     SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Cheap').setBackground('#B7E1CD').setRanges([sh.getRange('N2')]).build(),
     SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Fair').setBackground('#E8EAED').setRanges([sh.getRange('N2')]).build(),
     SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Above fair value').setBackground('#FCE8B2').setRanges([sh.getRange('N2')]).build(),
     SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo('Stretched').setBackground('#F4C7C3').setRanges([sh.getRange('N2')]).build()
-  ]);
+  ]));
   sh.getRange('B68:P68').merge().getCell(1, 1).setFormula('="Next earnings: "&' + svLook_(SHEET2.CALC, 'Next earnings') +
     '&"     Last EPS surprise: "&IFERROR(TEXT(' + svLook_(SHEET2.CALC, 'Last EPS surprise') + ',"+0.0%;-0.0%"),"n/a")' +
     '&"     Revisions (30 days): "&' + svLook_(SHEET2.CALC, 'Analyst revisions 30d')).setFontColor('#5F5E5A');
@@ -2738,7 +2786,9 @@ function saveNote_(t, text) {
 function renderStockView_() {
   var ss = SpreadsheetApp.getActive(), sh = ss.getSheetByName(SV.NAME);
   if (!sh) return;
-  var t = String(sh.getRange(SV.TICKER).getValue()).trim().toUpperCase();
+  var t = svTicker_(sh);
+  // Keep the picker's marker in step with the stock's current setup (this runs after every data refresh).
+  if (t) { var lbl = svLabelFor_(t); if (lbl && lbl !== String(sh.getRange(SV.TICKER).getValue()).trim()) sh.getRange(SV.TICKER).setValue(lbl); }
   sh.getRange(SV.NOTE_CELL).setValue(t ? getNote_(t) : '');
   var grid = t ? sensitivityFor_(t) : null;
   var G0 = SV.GRID_ROW, C0 = SV.GRID_COL;
@@ -2836,7 +2886,7 @@ function openInStockView() {
   var sh = ss.getSheetByName(SV.NAME);
   if (!sh) { buildStockView_(); sh = ss.getSheetByName(SV.NAME); }
   if (!t || cell.getRow() === 1) { ss.toast('Select a cell in a ticker row first.', 'Valuation', 5); return; }
-  sh.getRange(SV.TICKER).setValue(t);
+  sh.getRange(SV.TICKER).setValue(svLabelFor_(t));
   renderStockView_();
   ss.setActiveSheet(sh);
 }
