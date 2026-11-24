@@ -15,7 +15,7 @@
  */
 
 var SHEET = {
-  TICKERS: 'Tickers', HOLDINGS: 'Holdings', ASSUME: 'Assumptions',
+  TICKERS: 'Tickers', HOLDINGS: 'Holdings', ASSUME: 'Assumptions', SCEN: 'Scenarios',
   MARKET: 'Market', RAW: 'Raw Data', LOG: 'Log'
 };
 var DAY = 86400000;
@@ -168,14 +168,14 @@ function onEdit(e) {
   try {
     var name = e.range.getSheet().getName();
     if ((name === SHEET.TICKERS || name === SHEET.HOLDINGS) && e.range.getColumn() <= 2) { syncMarket_(); recalcValuations(); }
-    if (name === SHEET.ASSUME || (name === SHEET.TICKERS && e.range.getColumn() >= 5 && e.range.getColumn() <= 7)) recalcValuations();
+    if (name === SHEET.ASSUME || name === SHEET.SCEN ||
+      (name === SHEET.TICKERS && e.range.getColumn() >= 5 && e.range.getColumn() <= 7)) recalcValuations();
     if (name === ORDERS.NAME && e.range.getColumn() === 1 && e.range.getRow() > 1 && e.range.getValue() === true) {
       executeOrder_(e.range.getRow()); recalcValuations(); return;
     }
     if (name === SV.NAME) {
       var a1 = e.range.getA1Notation();
       if (a1 === SV.TICKER) renderStockView_();
-      else if (a1 === SV.NOTE_CELL || a1 === SV.NOTE_RANGE) saveNote_(svTicker_(e.range.getSheet()), e.range.getValue());
     }
   } catch (err) { /* never block an edit */ }
 }
@@ -193,6 +193,7 @@ function setup() {
   ensureSheet_(SHEET.RAW, RAW_COLS);
   ensureSheet_(SHEET.LOG, ['Time', 'Ticker', 'Message']);
   ss.getSheetByName(SHEET.RAW).setFrozenColumns(1);
+  buildScenarioTab_();
 
   nameSetting_('GitHub data URL', 'GITHUB_URL',
     'Link to data/raw_data.csv in your GitHub repository (raw.githubusercontent.com/...). See Start here.');
@@ -242,6 +243,64 @@ function nameSetting_(label, rangeName, note) {
   var cell = sh.getRange(row, 2);
   SpreadsheetApp.getActive().setNamedRange(rangeName, cell);
   return cell;
+}
+
+var SCEN_HEADERS = ['Ticker', 'Bear revenue growth', 'Bear net margin', 'Bull revenue growth', 'Bull net margin',
+  'Bear probability', 'Reason for the adjustment'];
+
+/**
+ * The Scenarios tab: per-stock adjustments to the scenario drivers, for structural changes that a company's own
+ * history cannot show. History sets the starting range; it should not settle the future on its own.
+ *   Only list a stock you are actually adjusting. Anything left blank keeps the measured figure, so an empty tab
+ * changes nothing and the tab stays short enough to read - which is the point of keeping it out of Tickers.
+ *   Calc records the measured drivers and the applied drivers side by side, plus whatever reason is given here,
+ * so an adjustment can never quietly replace the calculation it overrode.
+ */
+function buildScenarioTab_() {
+  var sh = ensureSheet_(SHEET.SCEN, SCEN_HEADERS);
+  if (sh.getLastRow() < 2 || !String(sh.getRange(2, 1).getValue()).trim()) {
+    sh.getRange(2, 1, 1, SCEN_HEADERS.length).setValues([['', '', '', '', '', '',
+      'Leave a row out and that stock uses its own measured history. Growth and margin as decimals: -0.05 is a 5% ' +
+      'revenue decline, 0.15 is a 15% net margin. Bear probability replaces the automatic one; the base case always ' +
+      'keeps 50%, so the bull case gets whatever is left. Always say why - Calc keeps the measured figures beside ' +
+      'yours for comparison.']]);
+    sh.getRange(2, 7).setFontColor('#888780').setFontStyle('italic');
+  }
+  sh.setColumnWidth(7, 420);
+  sh.getRange(2, 2, Math.max(sh.getMaxRows() - 1, 1), 4).setNumberFormat('0.0%');
+  sh.getRange(2, 6, Math.max(sh.getMaxRows() - 1, 1), 1).setNumberFormat('0%');
+  return sh;
+}
+
+/** Reads the Scenarios tab into a map of ticker -> adjustments. Blank cells are left undefined, not zeroed. */
+/**
+ * Reads a rate from the Scenarios tab as a decimal, whichever way the spreadsheet stored it.
+ *   Those cells are percent-formatted, and what a typed number becomes depends on the application and its
+ * settings: in one, 5 in a percent cell is 0.05; in another it is 5, meaning 500%. The difference is a factor of
+ * a hundred, and a bear case wrong by a hundredfold is worse than no bear case at all. Rather than rely on
+ * knowing which convention applies, anything above a plausible ceiling is read as a percentage figure and
+ * divided by 100 - a 500% net margin is not a view, it is a typing convention.
+ *   The interpreted value is printed back in the 'Scenario drivers used' column, so whatever is entered can be
+ * checked against what was actually applied.
+ */
+function pc_(v, ceiling) {
+  var x = n_(v);
+  if (x === null) return null;
+  if (Math.abs(x) > ceiling) x = x / 100;
+  return x;
+}
+
+function scenarioOverrides_() {
+  var sh = SpreadsheetApp.getActive().getSheetByName(SHEET.SCEN);
+  if (!sh || sh.getLastRow() < 2) return {};
+  var vals = sh.getRange(2, 1, sh.getLastRow() - 1, SCEN_HEADERS.length).getValues(), map = {};
+  vals.forEach(function (r) {
+    var t = String(r[0]).trim().toUpperCase();
+    if (!t) return;
+    map[t] = { bearG: pc_(r[1], 1.5), bearM: pc_(r[2], 1), bullG: pc_(r[3], 1.5), bullM: pc_(r[4], 1),
+      pBear: pc_(r[5], 1), why: String(r[6] || '').trim() };
+  });
+  return map;
 }
 
 function ensureSheet_(name, headers) {
@@ -873,6 +932,8 @@ var SETTINGS = [
   ['Discount rate floor', 0.07, '0.0%', ''],
   ['Discount rate cap', 0.14, '0.0%', ''],
   ['Required return (5-year models)', 0.10, '0.0%', 'Annual return used to discount the 5-year projection models back to today.'],
+  ['Analyst target gap cap', 0, '0%', 'Off by default: value is judged on fair value, not on how far analysts have lagged the price. Set it above 0% to make a very wide target gap stop supporting a setup, on the view that such targets have not caught up with a collapsed price. A gap over 100% is still flagged in Setup checks either way, so the information is there without blocking anything.'],
+  ['Margin of safety (cyclicals)', 0.25, '0%', 'How far below fair value a deep cyclical (refiners, oil and gas, miners, shipping, memory) must trade before it counts as cheap for a setup. Everything else only has to be below fair value. A cyclical fair value rests on a profit margin that can halve when the cycle turns, so a small discount is no protection. Set to 0% to treat cyclicals like everything else.'],
   ['Starting growth cap', 0.35, '0.0%', 'Year-1 growth is capped here, then fades to terminal growth by year 10.'],
   ['Growth floor', -0.10, '0.0%', ''],
   ['Terminal growth', 0.03, '0.0%', 'Long-run growth after year 10 (roughly nominal GDP).'],
@@ -889,11 +950,14 @@ var SETTINGS = [
   ['Cash available (£)', 0, '£#,##0', 'PORTFOLIO RULES. Uninvested cash in your account. Updated automatically when you tick an order Done on the Orders tab; correct it here after trades.'],
   ['Cash reserve', 0.05, '0%', 'Share of the portfolio always kept in cash.'],
   ['Max position (best ideas)', 0.10, '0.0%', 'Target size for the strongest opportunities. Weaker qualifying stocks get down to 40% of this.'],
-  ['Min position', 0.04, '0.0%', 'Smallest full position worth holding. When more stocks qualify than the portfolio has room for at this size, only the strongest are bought; the rest wait.'],
+  ['Min position', 0.025, '0.0%', 'Smallest full position worth holding. When more stocks qualify than the portfolio has room for at this size, only the strongest are bought; the rest wait. Lower it to hold more names at smaller weights.'],
+  ['Rotate out below direction', 0.75, '0%', 'Holdings with no buy setup, business signals below this, AND a failed quality gate are sold in stages to make room for stronger ideas. Their weight stops counting against the room for new buys. Set to 0% to switch rotation off. A holding whose business is still improving is never rotated out, however expensive it looks.'],
+  ['Max rotation per week', 0.05, '0%', 'Rotation sales in any 7 days stop at this share of the portfolio, so the book turns over gradually.'],
   ['Max position (cyclical)', 0.06, '0.0%', 'Memory, storage, metals and other boom-and-bust stocks.'],
   ['Max position (speculative)', 0.02, '0.0%', 'Loss-making, thinly covered or unqualified stocks. Holdings above 1.5x this are trimmed back to it.'],
   ['Max per industry', 0.35, '0%', 'New buys stop once an industry reaches this share of the portfolio.'],
-  ['Trim if any position above', 0.15, '0%', 'Any holding above this is trimmed back to its target.'],
+  ['Max per theme', 0.70, '0%', 'New buys stop once a theme reaches this share of INVESTED money (cash excluded). Themes group industries that move together, because one bet is often spread across several industry labels. Buys only: nothing is ever sold to get back under the cap.'],
+  ['Trim if any position above', 0.15, '0%', 'Any holding above this is trimmed back to its target - but only if the stock is above its own 200-day average, so a position that became overweight because the rest of the portfolio fell is left alone.'],
   ['Minimum order (£)', 250, '£#,##0', 'Smaller orders are skipped.'],
   ['Days between adds', 28, '0', 'Below the 200-day average, positions are built in thirds, at least this many days apart (or sooner on a further 10% fall).'],
   ['Max new money per week', 0.25, '0%', 'Pace limit: buys in any 7 days stop at this share of the cash available at the start of that week. 100% = no limit.'],
@@ -915,7 +979,9 @@ function settingsFromMap_(m) {
     aaa: aao !== '' && aao !== undefined && aao !== null ? Number(aao) : num('AAA corporate bond yield'),
     erp: num('Equity risk premium'), betaMin: num('Beta floor'), betaMax: num('Beta cap'),
     betaDefault: num('Beta if missing'), rMin: num('Discount rate floor'), rMax: num('Discount rate cap'),
-    req: num('Required return (5-year models)'), gCap: num('Starting growth cap'), gFadeCap: num('Max growth after forecast years'), gFloor: num('Growth floor'),
+    req: num('Required return (5-year models)'), mosCyc: num('Margin of safety (cyclicals)'),
+    tgtCap: num('Analyst target gap cap'),
+    gCap: num('Starting growth cap'), gFadeCap: num('Max growth after forecast years'), gFloor: num('Growth floor'),
     gTerm: num('Terminal growth'), peCap: num('Exit P/E cap'), pfcfCap: num('Exit P/FCF cap'),
     mos: num('Margin of safety'), sbc: /^y/i.test(String(g('Subtract stock-based comp from FCF'))),
     growthThreshold: num('Growth stock threshold (3-yr revenue CAGR)'),
@@ -964,6 +1030,59 @@ function projection5_(rev0, g0, gT, margin, mult, shares, dil, req, years, lead)
   var sh5 = shares * Math.pow(1 + dil, 5);
   var target = rev5 * margin * mult / sh5;
   return { fv: target / Math.pow(1 + req, 5), target: target };
+}
+
+/**
+ * Bear, base and bull five-year prices from the same earnings model, driven by what the business has actually
+ * done rather than by haircuts picked by hand: growth from its own best and worst revenue years, margin from its
+ * own best and worst net margins, and the exit multiple falling out of each growth path through the caller's own
+ * exitM(), so a slower business earns a lower multiple without anyone choosing one. The base case is the
+ * '5-yr earnings' model itself, so the three are directly comparable. Analyst lead years apply to the base case
+ * alone: a bear case built on this company's worst years should not also be handed consensus forecasts.
+ */
+function scenarioPrices_(c) {
+  // Growth is shifted by the same amount either side of the base case, analyst lead years included, so the three
+  // paths keep one shape and the ordering bear <= base <= bull is guaranteed rather than hoped for. Leaving the
+  // lead years out of the scenarios instead made the bull case land BELOW the base case for seven of sixteen
+  // stocks tested, because consensus near-term growth ran above anything in their own history.
+  // Bear and bull growth are absolute rates, so an override on the Scenarios tab can set them outright rather
+  // than only widen a band. The lead years shift by the same amount the growth did, keeping one path shape.
+  var gLo = c.gLo === undefined ? c.g0 - c.d : c.gLo, gHi = c.gHi === undefined ? c.g0 + c.d : c.gHi;
+  // Shifting the analyst lead year by the same amount keeps one path shape, which is what the automatic band
+  // wants. A rate typed on the Scenarios tab is different: someone who writes 0% means 0%, and shifting instead
+  // gave Sterling a bear case whose first year still grew 17% - consensus of 40% less the 23-point shift - so
+  // "flat revenue" came out as +20% over five years. An override therefore drops the lead and starts at the
+  // stated rate, fading to terminal growth like any other path.
+  var shiftLead = function (d, overridden) {
+    return overridden || !c.lead ? null : { g: c.lead.g + d, n: c.lead.n };
+  };
+  var loOvr = c.gLo !== undefined, hiOvr = c.gHi !== undefined;
+  var run = function (g, m, dil, lead, mult) {
+    var p = projection5_(c.rev, g, c.gT, m, mult, c.shares, dil, c.req, c.years, lead);
+    return { p5: p.target, fv: p.fv, g: g, m: m, mult: mult };
+  };
+  var multFor = function (g, lead) { return c.mult(mean_(growthPath_(g, c.gT, lead).slice(5, 10))); };
+  var dn = shiftLead(gLo - c.g0, loOvr), up = shiftLead(gHi - c.g0, hiOvr);
+  return {
+    // The bear case also gives up the buyback: a business in trouble stops shrinking its share count.
+    bear: run(gLo, c.mLo, Math.max(c.dil, 0), dn, multFor(gLo, dn)),
+    base: run(c.g0, c.mBase, c.dil, c.lead, c.multBase),
+    bull: run(gHi, c.mHi, c.dil, up, multFor(gHi, up)),
+    // A de-rating, identical in construction for every company and owing nothing to its own history. It isolates
+    // the one risk the measured bear case cannot see: a company whose six reported years are uniformly excellent
+    // gets a mild bear case by construction, which is the same blind spot a back-test has.
+    //   This and the bear case are not ordered, and neither is "the" floor - the bear case is worse where
+    // earnings are falling, the de-rating where the price rests on a high multiple. The downside to act on is the
+    // worse of the two, which is what scenFloorFv holds.
+    //   One driver moves here, deliberately: the exit multiple falls to 12, roughly a market multiple, and
+    // revenue, margin and share count are left exactly as the base case has them. The business performs as
+    // forecast and the market simply stops paying a premium for it.
+    //   Cutting the margin in half AND dropping the multiple to its floor AND cutting growth, which is what this
+    // case did first, put every stock in the universe between -69% and -99%: three severe cuts multiplied
+    // together are ruinous for everything and so distinguish nothing. Compressing the multiple alone
+    // discriminates, because it costs a 40x business most of its value and a 10x business nothing.
+    derate: run(c.g0, c.mBase, c.dil, c.lead, Math.min(12, c.multBase))
+  };
 }
 
 /** Solves for the year-1 growth rate that makes f(g) equal the price (f rises with g). */
@@ -1084,6 +1203,16 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   // Banks, brokers, insurers (6311-6411: their cash flow includes policyholders' premiums, so free-cash-flow
   // models overstate them; health plans, 6324, excluded as they run like service businesses) and investment
   // trusts are valued as financials.
+  // Deposit-taking banks (6020-6036) and brokers (6211) are financials whatever their capex looks like. The
+  // capex-to-revenue escape below exists to catch an operating business hiding behind a financial SIC code,
+  // and it is still needed for the catch-all codes - IREN and Cipher Mining both file under 6199, "finance
+  // services", while spending many times their revenue on data centres. But banks do not report one headline
+  // revenue figure and the parser often picks up a fraction of the real one: M&T, Fifth Third, Huntington and
+  // Regions all came through at a sixth or less of their true revenue. A ratio built on that is noise, and
+  // failing the test sent the bank down the ROIC path, where ROIC reads n/a for a bank and fails the quality
+  // gate on its own - M&T scored quality 100% and was still rejected. So the escape is not offered to a
+  // company whose SIC code can only mean a bank or a broker.
+  else if ((sic >= 6020 && sic <= 6036) || sic === 6211) type = 'Financial';
   else if (((sic >= 6000 && sic <= 6299) || (sic >= 6311 && sic <= 6411 && sic !== 6324) || sic === 6726) && !(rev && capex / rev > 0.1)) type = 'Financial';
   else if ((raw.CIK === 'LSE' && !raw.Sector) || ((raw.CIK === 'LSE' || raw.CIK === 'YAHOO') && (raw.Sector === 'Financial Services' || raw.Sector === 'Real Estate'))) type = 'Financial';
   else if (sic >= 4900 && sic <= 4949 && ni !== null && ni > 0 && !/Independent|Renewable/i.test(String(raw['Yahoo industry'] || ''))) type = 'Utility';
@@ -1193,6 +1322,22 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var fcfMarginAvg = margins(function (i) { var o = fy('OCF', i), c = fy('Capex', i) || 0; return o === null ? null : o - c; });
   var netMarginNow = ni !== null && rev ? ni / rev : null;
   var netMarginAvg = margins(function (i) { return fy('NetIncome', i); });
+  // Consensus implied net margin at the analysts' second forecast year: their EPS and revenue for that year
+  // measured against the latest 12 months. This is the one number the sheet never held, and its absence let a
+  // bear case be set at the base case without anything saying so - PBF's bear margin was put at 2% on
+  // 24 November 2026 when 2% was what analysts expected, and only a screenshot caught it.
+  //   Analysts' EPS is per quoted share, so it is compared with the model's own EPS (net income / the share
+  // count used everywhere else) and never with the filed 'EPS TTM'. Where those two share bases differ the
+  // mix is silently wrong by that factor: SanDisk files 7.4x the quoted count, which turns a 67% margin into
+  // 9%. Revenue cancels its own currency; EPS does not, hence the fx on it.
+  out.consRevGrowth = gCons;
+  out.consMargin = null;
+  if (consensus && estEps2 !== null && eps !== null && eps > 0 && estRev2 > 0 && rev > 0 && netMarginNow !== null) {
+    var cm = netMarginNow * (estEps2 * fx / eps) / (estRev2 / rev);
+    if (isFinite(cm) && cm > -1 && cm < 0.95) out.consMargin = cm;
+    else out.notes.push('Consensus implied margin came out at ' + Math.round(cm * 100) +
+      '%: analysts\' EPS and revenue are on different bases, so it is not shown');
+  }
   var ovM = n_(ovr.margin);
   if (ovM !== null && ovM > 1.5) ovM = ovM / 100;
   // Long-run margins: average of the latest 12 months and the last 3 fiscal years
@@ -1236,9 +1381,11 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var analystsSeeGrowth = consensus && estRev2 >= (rev || 0) * 0.95;
   var cycAvgNet = mean_([netMarginNow].concat(netFY).filter(function (x) { return x !== null; }));
   // Commodity producers: a margin well above the cycle average is enough (their revenue need not jump; refiners'
-  // margins are thin, so the bar is 5%, not 15%).
+  // margins are thin, so the bar is 5%, not 15%). Their bar is 1.3x the cycle average, not 1.5x: at 1.5x the
+  // refiners and shipping names earning 1.46-1.50x in the 2026 war-driven crack boom slipped under the brake
+  // while deeper-cycle peers got it, so the safeguard missed exactly the cases it exists for.
   var peak = deepCyc && ovM === null && netMarginNow !== null && cycAvgNet !== null &&
-    (commodity ? netMarginNow > 0.05 && netMarginNow > 1.5 * Math.max(cycAvgNet, 0.02)
+    (commodity ? netMarginNow > 0.05 && netMarginNow > 1.3 * Math.max(cycAvgNet, 0.02)
                : yoy !== null && yoy > 0.5 && netMarginNow > 0.15 && netMarginNow > 1.5 * Math.max(cycAvgNet, 0.02));
   out.cyclicalPeak = peak;
   var fcfBase = fcf, epsBase = eps;
@@ -1361,6 +1508,98 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
     var p5 = projection5_(projRev, g0, gT, mN, peLater, shares, dilP, S.req, projYears, lead);
     M['5-yr earnings'] = p5.fv;
     out.target5 = p5.target;
+    // Scenario drivers, measured from this company's own reported fiscal years rather than assumed.
+    var revFY = [], ri;
+    for (ri = 0; ri <= 5; ri++) revFY.push(fy('Revenue', ri));
+    var gHist = [];
+    for (ri = 0; ri + 1 < revFY.length; ri++) {
+      if (revFY[ri] !== null && revFY[ri + 1] !== null && revFY[ri + 1] > 0) gHist.push(revFY[ri] / revFY[ri + 1] - 1);
+    }
+    var marHist = [netMarginNow].concat(netFY).filter(function (x) { return x !== null && isFinite(x); });
+    if (gHist.length >= 2 && marHist.length >= 2) {
+      // The drivers are quartiles of this company's own history, not its single best and worst years, and each is
+      // then bounded. Taking the extreme of growth, margin and multiple together and compounding all three for
+      // five years does not describe a bad or a good five years - it multiplies three tails into a number nobody
+      // would act on. Unbounded, this produced a $3 bear case for Micron, whose own worst year it survived
+      // comfortably, and a $6,676 bull case for Marathon against a $361 price.
+      //   Growth moves at most 10 points either side of the base case: a scenario is a different outcome for this
+      // business, not a different decade.
+      //   The bear margin is floored at half the base margin, and for a deep cyclical the bull margin is capped at
+      // 1.3x the cycle average - the same multiple the peak brake uses, because a boom margin held for five years
+      // is the assumption that brake exists to refuse. The bear case models a downturn, not insolvency; whether a
+      // company can fail outright is what the debt gate is for, and no multiple of a margin answers it.
+      var q = function (a, p) {
+        var s = a.slice().sort(function (x, y) { return x - y; });
+        var i = clamp_((s.length - 1) * p, 0, s.length - 1), lo = Math.floor(i), hi = Math.ceil(i);
+        return s[lo] + (s[hi] - s[lo]) * (i - lo);
+      };
+      // Band width = half this company's own interquartile growth spread, so a steady business gets narrow
+      // scenarios and a volatile one wide ones, bounded to between 2 and 10 points.
+      var gD = clamp_((q(gHist, 0.75) - q(gHist, 0.25)) / 2, 0.02, 0.10);
+      var mLo0 = clamp_(q(marHist, 0.25), Math.max(mN * 0.5, 0.01), mN);
+      var mHi0 = 0, gLo0 = g0 - gD, gHi0 = g0 + gD;
+      var mCap = deepCyc && cycAvgNet !== null && cycAvgNet > 0 ? Math.max(cycAvgNet * 1.3, mN) : 0.6;
+      mHi0 = clamp_(q(marHist, 0.75), mN, Math.min(mCap, 0.6));
+
+      // The measured drivers are now fixed and recorded. Anything on the Scenarios tab is applied over them, for
+      // a structural change this company's own history cannot show: an AI server cycle inflating Dell's growth,
+      // acquisitions flattering Broadcom's, generative AI threatening margins Adobe has never seen pressured. The
+      // bounds that stop the measured drivers compounding into nonsense are deliberately NOT applied here - an
+      // adjustment is a judgement someone has signed their name to, and the reason sits beside it in Calc.
+      var sc = (ovr.scen || {});
+      var gLo = sc.bearG !== null && sc.bearG !== undefined ? sc.bearG : gLo0;
+      var gHi = sc.bullG !== null && sc.bullG !== undefined ? sc.bullG : gHi0;
+      var mLo = sc.bearM !== null && sc.bearM !== undefined ? sc.bearM : mLo0;
+      var mHi = sc.bullM !== null && sc.bullM !== undefined ? sc.bullM : mHi0;
+      // An override can break the ordering the measured path guarantees, so put it back: a bull case below the
+      // base case, or a bear case above it, is a typo rather than a view.
+      gLo = Math.min(gLo, g0); gHi = Math.max(gHi, g0);
+      mLo = Math.min(mLo, mN); mHi = Math.max(mHi, mN);
+      var set_ = function (x) { return x !== null && x !== undefined; };
+      // The check that was missing. A bear margin at or above what analysts already forecast is not a bear
+      // case, whoever wrote it and however carefully it was researched. The comparison is shown either way,
+      // because the two consensus horizons disagree - Yahoo's second forecast year put PBF at 5.6% while
+      // Simply Wall St's three-year rate implied 2.0% - so this flags the question rather than settling it.
+      out.scenBearVsCons = null;
+      if (out.consMargin !== null && mLo !== null && isFinite(mLo)) {
+        var pm = function (x) { return (x * 100).toFixed(1) + '%'; };
+        out.scenBearVsCons = (mLo >= out.consMargin ? 'ABOVE CONSENSUS - this is the base case, not a bear case: ' : '') +
+          'bear ' + pm(mLo) + ' vs consensus ' + pm(out.consMargin) + ' at the second forecast year';
+      }
+      out.scenAdjusted = set_(sc.bearG) || set_(sc.bullG) || set_(sc.bearM) || set_(sc.bullM) || set_(sc.pBear);
+      out.scenPBearOvr = sc.pBear === undefined ? null : sc.pBear;
+      out.scenWhy = sc.why || '';
+      var mkScen = function (a, b, c2, d2) {
+        return scenarioPrices_({
+          rev: projRev, gT: gT, g0: g0, d: gD, gLo: a, gHi: b, mBase: mN, mLo: c2, mHi: d2,
+          shares: shares, dil: dilP, req: S.req, years: projYears, lead: lead, multBase: peLater,
+          // The exit multiple follows each growth path through the same function the base case uses, but is held
+          // within 30% of the base multiple. Left free it swings with growth and then multiplies a margin that has
+          // already moved the same way, compounding one judgement twice.
+          mult: function (g) { return clamp_(exitM(g, peCapX), peLater * 0.7, peLater * 1.3); }
+        });
+      };
+      // Both sets are kept, not one overwritten by the other. An adjustment is only worth making if it can be
+      // compared with the calculation it replaced, so the measured case stays on the tab beside it rather than
+      // surviving as a sentence describing numbers that are no longer anywhere.
+      out.scenMeas = mkScen(gLo0, gHi0, mLo0, mHi0);
+      out.scen = out.scenAdjusted ? mkScen(gLo, gHi, mLo, mHi) : out.scenMeas;
+      out.scenYears = gHist.length;
+      var pcS = function (x) { return Math.round(x * 100) + '%'; };
+      // Recorded separately on purpose: the calculation, then what was actually used. If the two differ, the
+      // reason column says who thought what and why, and the measured figure is still there to argue with.
+      out.scenMeasured = 'Revenue growth ' + pcS(gLo0) + ' bear, ' + pcS(g0) + ' base, ' + pcS(gHi0) +
+        ' bull (base +/- ' + pcS(gD) + ', half its interquartile spread over ' + gHist.length +
+        ' reported years). Net margin ' + pcS(mLo0) + ' / ' + pcS(mN) + ' / ' + pcS(mHi0);
+      out.scenBasis = 'Revenue growth ' + pcS(gLo) + ' bear, ' + pcS(g0) + ' base, ' + pcS(gHi) +
+        ' bull. Net margin ' + pcS(mLo) + ' / ' + pcS(mN) + ' / ' + pcS(mHi) + '. Exit P/E ' +
+        out.scen.bear.mult.toFixed(1) + ' / ' + out.scen.base.mult.toFixed(1) + ' / ' + out.scen.bull.mult.toFixed(1) +
+        '. De-rated: the base case on an exit P/E of 12' +
+        (dilP < 0 ? '. The bear case also drops the buyback, which is shrinking the share count ' +
+          Math.abs(Math.round(dilP * 100)) + '% a year, so that alone costs it ' +
+          Math.round((1 - Math.pow(1 + dilP, 5)) * 100) + '% over five years' : '') +
+        (out.scenAdjusted ? '. ADJUSTED from the measured drivers - see the reason column' : '');
+    }
   }
   var useEstEps = consensus && !peak && estEps2 !== null && estEps2 > 0;
   if (useEstEps || (epsBase !== null && epsBase > 0)) {
@@ -1568,7 +1807,73 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   out.score = avail.filter(function (k) { return sig[k]; }).length;
   out.scoreOf = avail.length;
   out.scorePct = avail.length ? out.score / avail.length : null;
+
+  // Scenario probabilities. The base case always keeps half the weight; the other half shifts from bull to bear as
+  // the evidence weakens, because a wide spread between the valuation models, deteriorating business signals and a
+  // deep cycle are each reasons to expect the downside rather than the upside. This is not a forecast: it is one
+  // rule applied the same way to every holding, and all three prices are shown so the weighting can be judged
+  // instead of trusted. A stock whose scenarios cannot be measured gets no scenario figures at all.
+  if (out.scen) {
+    var pB = 0.25;
+    if (out.confidence === 'Low') pB += 0.10; else if (out.confidence === 'Medium') pB += 0.05;
+    if (out.scorePct !== null && out.scorePct < 0.5) pB += 0.10;
+    else if (out.scorePct !== null && out.scorePct < 0.75) pB += 0.05;
+    if (out.deepCyclical) pB += 0.05;
+    pB = clamp_(pB, 0.10, 0.45);
+    var pAuto = pB;
+    // A probability set by hand replaces the automatic one outright, bounded only so the bull case keeps some
+    // weight. Probabilities deserve to be considered rather than computed, and the automatic rule exists because
+    // 305 stocks cannot each be thought about every day - not because it is better than thinking.
+    if (out.scenPBearOvr !== null && out.scenPBearOvr !== undefined) pB = clamp_(out.scenPBearOvr, 0.05, 0.49);
+    out.scenProbText = Math.round(pB * 100) + ' / 50 / ' + Math.round((0.5 - pB) * 100) +
+      (out.scenPBearOvr !== null && out.scenPBearOvr !== undefined ? ' (set by hand)' : '');
+    out.scenAdjustedText = out.scenAdjusted ? 'Yes' : '';
+    out.scenBearP5 = out.scen.bear.p5; out.scenBullP5 = out.scen.bull.p5;
+    out.scenDerateP5 = out.scen.derate.p5;
+    // The automatic probability, kept whatever was set by hand, so the measured table on Stock view is the
+    // untouched calculation all the way through rather than the measured prices under a chosen weighting.
+    out.scenBearP5M = out.scenMeas.bear.p5; out.scenBullP5M = out.scenMeas.bull.p5;
+    out.scenProbTextM = Math.round(pAuto * 100) + ' / 50 / ' + Math.round((0.5 - pAuto) * 100);
+    // The scenarios scale the BLENDED fair value, they do not replace it. Each case is expressed as a ratio to
+    // the base case of the same model and that ratio is applied to out.fv, the median of every model allowed for
+    // the type. Reading the scenario values straight off the five-year earnings model instead would have compared
+    // one model against a median of eight: Nvidia's scenario return came out at 45% a year against 21% from the
+    // existing column, a gap that was nearly all model mix rather than scenario weighting.
+    if (out.fv && out.scen.base.p5 > 0) {
+      var ratio = function (s) { return s.p5 / out.scen.base.p5; };
+      out.scenBearFv = out.fv * ratio(out.scen.bear);
+      out.scenBullFv = out.fv * ratio(out.scen.bull);
+      out.scenDerateFv = out.fv * ratio(out.scen.derate);
+      // Weighted across the terminal outcomes, then expressed as a fair value - not an average of the three
+      // annualised returns, which would be wrong because compounding is not linear.
+      out.scenFv = out.scenBearFv * pB + out.fv * 0.5 + out.scenBullFv * (0.5 - pB);
+      out.scenFloorFv = Math.min(out.scenBearFv, out.scenDerateFv);
+      // The measured set, on the same footing: ratios to the same base case, applied to the same blended fair
+      // value. De-rated and base are untouched by an adjustment, so those two columns serve both tables.
+      var ratioM = function (sn) { return sn.p5 / out.scenMeas.base.p5; };
+      out.scenBearFvM = out.fv * ratioM(out.scenMeas.bear);
+      out.scenBullFvM = out.fv * ratioM(out.scenMeas.bull);
+      out.scenFvM = out.scenBearFvM * pAuto + out.fv * 0.5 + out.scenBullFvM * (0.5 - pAuto);
+      var floorM = Math.min(out.scenBearFvM, out.scenDerateFv);
+      if (floorM > 0) out.scenSpanM = out.scenBullFvM / floorM;
+      // How far apart the best and worst cases are. A span in the tens means the five-year model cannot
+      // discriminate for this company at all and no central estimate from it deserves weight - which is itself
+      // worth reading, and tends to coincide with a wide spread between the models.
+      if (out.scenFloorFv > 0) out.scenSpan = out.scenBullFv / out.scenFloorFv;
+    }
+  }
   out.scoreChange = past && past.score !== null && past.score !== undefined && past.score !== '' ? out.score - past.score : null;
+  // Change in the analyst price target since roughly a month ago. Targets and earnings estimates can move in
+  // opposite directions: after the November 2026 midterms, brokers raised Sterling's EPS forecasts on a strong
+  // quarter while cutting its price target 18-24% on the risk to its data-centre pipeline. Tracking only the
+  // estimate revision saw the good half of that and missed the warning.
+  out.targetChange = past && past.tgtOld > 0 && out.analystTarget > 0 ? out.analystTarget / past.tgtOld - 1 : null;
+  // Say which it is. A blank here fed tgtCut, and tgtCut gates analystsAgree, so with no history the "targets
+  // are being cut" test has never once fired - for any stock, since the model was built. That is a silent pass,
+  // not a pass on the evidence, and it should be visible in the row rather than inferred from an empty cell.
+  out.targetChangeBasis = out.targetChange !== null
+    ? 'vs ' + Math.round(past.tgtAge) + ' days ago'
+    : (out.analystTarget > 0 ? 'no History row 14-120 days old yet: target cut check cannot run' : '');
   out.signalText = keys.map(function (k) { return k + (sig[k] === null ? ' –' : sig[k] ? ' ↑' : ' ↓'); }).join('  ');
   setupFor_(out, raw, price, eps, type, S);
   return out;
@@ -1620,9 +1925,25 @@ function setupFor_(out, raw, price, eps, type, S) {
   var growth = Math.max(out.revYoY === null || out.revYoY === undefined ? -1 : out.revYoY, out.epsGrowth === null || out.epsGrowth === undefined ? -1 : out.epsGrowth);
   var impl = typeof out.implied === 'number' ? out.implied : null;
   var pricedIn = impl !== null && growth > 0 && impl <= growth;
-  var cheap = exp >= S.req;                          // price at or below fair value
+  // Price at or below fair value - but a deep cyclical must be further below it. Its fair value rests on a
+  // margin that can halve when the cycle turns, so a small discount is not a margin of safety at all: at
+  // record 2026 crack spreads and freight rates, a shipping name 13% below fair value is a rounding error.
+  var mosNeed = out.deepCyclical ? (S.mosCyc || 0) : 0;
+  var cheap = mosNeed > 0 ? price <= out.fv * (1 - mosNeed) : exp >= S.req;
   var dir = out.scorePct || 0, roic = out.roic;
-  var analystsAgree = tUp !== null && tUp >= 0.15 && !thin;
+  // Analysts confirm the case only when the target is meaningfully above the price AND still believable.
+  // A gap beyond the cap means the targets have not caught up with a collapsed price, not that there is that
+  // much upside: every name on this list with a gap over 120% is 66-86% below its 52-week high. And targets
+  // being cut is a warning in its own right, exactly as falling earnings estimates are.
+  var tgtCut = out.targetChange !== null && out.targetChange < -0.10;
+  var capped = tUp !== null && S.tgtCap > 0 && tUp > S.tgtCap;
+  var analystsAgree = tUp !== null && tUp >= 0.15 && !capped && !thin && !tgtCut;
+  // Flagged for information whether or not the cap is on, so a very wide gap is visible without deciding
+  // anything: a target far above the price says the brokers have lagged a fall, which is worth seeing, but
+  // it is not evidence about value, and value is what the setups are judged on.
+  out.targetsWide = tUp !== null && tUp > 1.0;
+  out.targetsStale = capped;
+  out.targetsCut = tgtCut;
 
   var s = '';
   var debtOK = !out.highDebt;
@@ -1630,9 +1951,21 @@ function setupFor_(out, raw, price, eps, type, S) {
   // Long-term investing: a falling price does not block a setup (the best prices are often below trend);
   // falling analyst forecasts do.
   else if (!spec && cheap && analystsAgree && !estDown && dir >= 0.6) s = 'Value setup';
-  else if (!spec && !cheap && roic !== null && roic >= 0.12 && dir >= 0.75 && growth >= 0.12 && pricedIn && estUp &&
+  // A deep cyclical is never a Compounder. That setup exists for businesses that compound through cycles and so
+  // rarely look cheap; a refiner or shipping name at peak margins is the opposite case - it looks expensive
+  // because the cycle is high, not because the business is durable. Without this it would simply fall through
+  // from Value setup to Compounder when the cyclical margin of safety is not met, and still read as a buy.
+  else if (!spec && !out.deepCyclical && !cheap && roic !== null && roic >= 0.12 && dir >= 0.75 && growth >= 0.12 && pricedIn && estUp &&
     trendUp !== false && (tUp === null || tUp > 0)) s = 'Compounder';
-  else if (!spec && trendDown && !estDown && dir >= 0.6 && roic !== null && roic >= 0.12 && analystsAgree && pricedIn) s = 'Quality pullback';
+  // Quality pullback needs a valuation floor of its own. The point of the setup is to catch a good business on
+  // a dip that is not quite cheap enough for a Value setup, so it cannot demand the full cheapness test - that
+  // test is what the Value setup branch above already applies, and requiring it here would make this branch
+  // unreachable. But it must at least require the price to be at or below fair value, with the cyclical margin
+  // of safety on top where that applies. Without any valuation test, a stock at three times fair value read as
+  // a buy-type setup and drew a target weight purely on quality and momentum: Palantir qualified here while the
+  // same sheet put its expected five-year return at -12% a year.
+  else if (!spec && trendDown && !estDown && dir >= 0.6 && roic !== null && roic >= 0.12 && analystsAgree && pricedIn &&
+    out.fv > 0 && price <= out.fv * (1 - mosNeed)) s = 'Quality pullback';
   else if (!spec && cheap && dir >= 0.5 && estDown) s = 'Value, estimates falling';
   else if (!spec && !cheap && roic !== null && roic >= 0.12 && growth >= 0.1 && !estUp && (trendDown || (v2 !== null && v2 < -0.15))) s = 'Trend broken';
   else if (tUp !== null && tUp >= 0.3 && thin) s = 'Thin targets';
@@ -1641,7 +1974,11 @@ function setupFor_(out, raw, price, eps, type, S) {
   var tick = function (b) { return b === null ? '–' : b ? '✓' : '✗'; };
   out.setupScore = [cheap, analystsAgree, estUp, dir >= 0.75, trendUp === true, roic !== null && roic >= 0.15, pricedIn && !out.highDebt]
     .filter(function (b) { return b; }).length;
-  out.setupChecks = 'Value ' + tick(cheap) + '  Analysts ' + (tUp === null ? '–' : thin ? '? (thin)' : tick(analystsAgree)) +
+  out.setupChecks = 'Value ' + tick(cheap) + '  Analysts ' +
+    (tUp === null ? '–' : thin ? '? (thin)'
+      : out.targetsStale ? '? (targets ' + Math.round(tUp * 100) + '% above price, not caught up)'
+      : tgtCut ? '✗ (target cut ' + Math.round(out.targetChange * 100) + '%)'
+      : tick(analystsAgree) + (out.targetsWide ? ' (note: targets ' + Math.round(tUp * 100) + '% above price)' : '')) +
     '  Estimates ' + (estUp ? '↑' : estDown ? '↓' : '–') + '  Quality ' + tick(roic === null ? null : roic >= 0.15 && dir >= 0.6) +
     '  Trend ' + (trendUp === null ? '–' : trendUp ? '↑' : trendDown ? '↓' : '→') + '  Priced-in growth ' + tick(impl === null ? null : pricedIn) +
     '  Debt ' + (out.highDebt ? '✗' : out.ndEbitda === null && out.intCover === null ? '–' : '✓') +
@@ -1673,7 +2010,27 @@ var CALC_COLS = [
   ['5-yr earnings', '#,##0.00', 'm:5-yr earnings'], ['Fwd EPS x P/E', '#,##0.00', 'm:Fwd EPS x P/E'],
   ['Graham', '#,##0.00', 'm:Graham'], ['Lynch', '#,##0.00', 'm:Lynch'], ['Dividend discount', '#,##0.00', 'm:Dividend discount'],
   ['Justified P/B', '#,##0.00', 'm:Justified P/B'],
-  ['5-yr price (earnings model)', '#,##0.00', 'target5'], ['Dividend yield', '0.0%', 'divYield'],
+  ['5-yr price (earnings model)', '#,##0.00', 'target5'],
+  ['Bear 5-yr price', '#,##0.00', 'scenBearP5'], ['Bull 5-yr price', '#,##0.00', 'scenBullP5'],
+  ['De-rated 5-yr price (exit P/E 12)', '#,##0.00', 'scenDerateP5'],
+  ['Bear price CAGR', '0.0%;[Red]-0.0%', 'F:bearcagr'], 
+  ['Bear fair value', '#,##0.00', 'scenBearFv'], ['Bull fair value', '#,##0.00', 'scenBullFv'],
+  ['De-rated fair value', '#,##0.00', 'scenDerateFv'],
+  ['Bear downside', '0.0%;[Red]-0.0%', 'F:beardown'], ['De-rating downside', '0.0%;[Red]-0.0%', 'F:deratedown'],
+  ['Downside (worse case)', '0.0%;[Red]-0.0%', 'F:floordown'], ['Scenario span (bull/worst)', '0.0x', 'scenSpan'],
+  ['Scenario fair value', '#,##0.00', 'scenFv'], ['Scenario exp. return', '0.0%;[Red]-0.0%', 'F:scenret'],
+  ['Scenario probabilities (bear/base/bull)', '@', 'scenProbText'],
+  ['Bear 5-yr price (measured)', '#,##0.00', 'scenBearP5M'], ['Bull 5-yr price (measured)', '#,##0.00', 'scenBullP5M'],
+  ['Bear fair value (measured)', '#,##0.00', 'scenBearFvM'], ['Bull fair value (measured)', '#,##0.00', 'scenBullFvM'],
+  ['Scenario fair value (measured)', '#,##0.00', 'scenFvM'],
+  ['Downside (worse case, measured)', '0.0%;[Red]-0.0%', 'F:floordownm'],
+  ['Scenario span (measured)', '0.0x', 'scenSpanM'], ['Scenario probabilities (measured)', '@', 'scenProbTextM'],
+  ['Scenario drivers used', '@', 'scenBasis'], ['Scenario drivers measured', '@', 'scenMeasured'],
+  ['Scenario adjusted', '@', 'scenAdjustedText'], ['Reason for the adjustment', '@', 'scenWhy'],
+  ['Consensus revenue growth (to FY2)', '0.0%;[Red]-0.0%', 'consRevGrowth'],
+  ['Consensus net margin (FY2)', '0.0%;[Red]-0.0%', 'consMargin'],
+  ['Bear margin vs consensus', '@', 'scenBearVsCons'],
+  ['Dividend yield', '0.0%', 'divYield'],
   ['Revenue growth 1-yr', '0.0%;[Red]-0.0%', 'revYoY'], ['Revenue growth 3-yr CAGR', '0.0%;[Red]-0.0%', 'revCagr3'],
   ['Gross margin', '0.0%;[Red]-0.0%', 'grossMargin'], ['Operating margin', '0.0%;[Red]-0.0%', 'opMargin'],
   ['FCF margin', '0.0%;[Red]-0.0%', 'fcfMargin'], ['ROIC', '0.0%;[Red]-0.0%', 'roic'],
@@ -1681,6 +2038,8 @@ var CALC_COLS = [
   ['Cash runway (months)', '0', 'runway'], ['Dilution 1-yr', '0.0%;[Red]-0.0%', 'dilution'],
   ['Data as of', '@', 'dataDate'], ['Notes', '@', 'notesText'],
   ['Analyst target', '#,##0.00', 'analystTarget'], ['Analyst target upside', '0.0%;[Red]-0.0%', 'F:tupside'],
+  ['Analyst target change 30d', '+0.0%;[Red]-0.0%', 'targetChange'],
+  ['Analyst target change basis', '@', 'targetChangeBasis'],
   ['Analysts', '0', 'analysts'],
   ['EPS for PEG', '#,##0.00', 'pegEps'], ['Expected EPS growth', '0.0%;[Red]-0.0%', 'epsGrowth'], ['PEG basis', '@', 'epsGrowthBasis'],
   ['PEG', '0.00', 'F:peg'], ['Expectations gap (implied - expected growth)', '+0.0%;[Red]-0.0%', 'expGap'],
@@ -1711,6 +2070,32 @@ function calcFormula_(key, r) {
     case 'expret':
       // Annual return if the price moves to fair value over 5 years while the business earns the required return.
       return '=IF(OR(' + G + '="",' + P + '="",N(' + P + ')<=0,N(' + G + ')<=0),"",(' + G + '/' + P + ')^(1/5)*(1+REQ_RETURN)-1)';
+    case 'bearcagr':
+      // The plain price CAGR to the bear five-year price: what the share price alone would do, with no required
+      // return folded in. Kept separate from the expected-return columns on purpose, so the two conventions
+      // cannot be read as the same number.
+      var BP = c('Bear 5-yr price');
+      return '=IF(OR(' + BP + '="",' + P + '="",N(' + P + ')<=0,N(' + BP + ')<=0),"",(' + BP + '/' + P + ')^(1/5)-1)';
+    case 'beardown':
+      // Downside on today's price if the bear case is what happens - the same convention as Upside, so the two
+      // can be read as a pair: what there is to gain, and what there is to lose.
+      var BD = c('Bear fair value');
+      return '=IF(OR(' + BD + '="",' + P + '="",N(' + P + ')<=0),"",' + BD + '/' + P + '-1)';
+    case 'deratedown':
+      var SD = c('De-rated fair value');
+      return '=IF(OR(' + SD + '="",' + P + '="",N(' + P + ')<=0),"",' + SD + '/' + P + '-1)';
+    case 'floordownm':
+      var FDM = calcL_('Bear fair value (measured)') + r, FSM = calcL_('De-rated fair value') + r;
+      return '=IF(OR(' + FDM + '="",' + FSM + '="",' + P + '="",N(' + P + ')<=0),"",MIN(' + FDM + ',' + FSM + ')/' + P + '-1)';
+    case 'floordown':
+      // The number to act on: whichever of the measured bear case and the de-rating is worse.
+      var FD = calcL_('Bear fair value') + r, FS = calcL_('De-rated fair value') + r;
+      return '=IF(OR(' + FD + '="",' + FS + '="",' + P + '="",N(' + P + ')<=0),"",MIN(' + FD + ',' + FS + ')/' + P + '-1)';
+    case 'scenret':
+      // Same convention as Exp. 5-yr return, but to the probability-weighted fair value instead of the median of
+      // the models, so the two sit side by side and can be compared directly.
+      var SF = c('Scenario fair value');
+      return '=IF(OR(' + SF + '="",' + P + '="",N(' + P + ')<=0,N(' + SF + ')<=0),"",(' + SF + '/' + P + ')^(1/5)*(1+REQ_RETURN)-1)';
     case 'status':
       var M = c('Exp. 5-yr return (a year)');
       return '=IF(OR(' + G + '="",' + P + '=""),"No valuation",IF(OR(' + P + '>' + H + ',AND(' + M + '<>"",' + M + '<STRETCH_RETURN)),"Stretched",IF(' + P + '>' + G + ',"Above fair value",IF(' + P + '>=' + J + ',"Fair","Cheap"))))';
@@ -1728,6 +2113,9 @@ function calcFormula_(key, r) {
 /** Recalculates every valuation. Runs after each data load, and when settings or overrides change. */
 function recalcValuations() {
   var ss = SpreadsheetApp.getActive();
+  // Idempotent, and here as well as in setup() so an existing workbook gains the tab on its next recalculation
+  // rather than only after a full setup run.
+  buildScenarioTab_();
   var today = dnum_(Utilities.formatDate(new Date(), 'UTC', 'yyyy-MM-dd'));
   var S = settingsFromMap_(assumptionsMap_());
 
@@ -1745,6 +2133,7 @@ function recalcValuations() {
   var tk = ss.getSheetByName(SHEET.TICKERS);
   var tv = tk.getLastRow() > 1 ? tk.getRange(2, 1, tk.getLastRow() - 1, 7).getValues() : [];
   var hist = historyIndex_(today);
+  var scenOvr = scenarioOverrides_();
   var hs = ss.getSheetByName(SHEET.HOLDINGS), held = {};
   if (hs.getLastRow() > 1) hs.getRange(2, 1, hs.getLastRow() - 1, 1).getValues().forEach(function (r) { var t = String(r[0]).trim().toUpperCase(); if (t) held[t] = 1; });
 
@@ -1770,7 +2159,7 @@ function recalcValuations() {
     else rate = fx[rw.Currency + m.currency] || null;
     var v;
     try {
-      v = valueCompany(rw, m, rate, { type: r[4], growth: r[5], margin: r[6] }, S, hist[t] || null, today);
+      v = valueCompany(rw, m, rate, { type: r[4], growth: r[5], margin: r[6], scen: scenOvr[t] || null }, S, hist[t] || null, today);
     } catch (e) { v = { type: 'Error', notes: [e.message], models: {}, signals: {} }; }
     v.sector = rw.Sector || '';
     v.splitDate = String(rw['Last split date'] || '').slice(0, 10); v.splitRatio = Number(rw['Last split ratio']) || null;
@@ -1810,6 +2199,11 @@ function recalcValuations() {
 
   snapshotHistory_(out, today);
   try { writeScorecard_(out, market, today); } catch (e) { log_('', 'Scorecard: ' + e.message); }
+
+  // The picker holds a column reference, so refresh it here too: adding Calc columns moves Pick label and
+  // silently leaves the dropdown aimed at whatever letter it used to occupy.
+  var svSheet = ss.getSheetByName(SV.NAME);
+  if (svSheet) setPicker_(svSheet);
 }
 
 function assumptionsMap_() {
@@ -1857,13 +2251,26 @@ function historyIndex_(today) {
   var sh = ensureSheet_(SHEET2.HIST, HIST_COLS);
   var out = {};
   if (sh.getLastRow() < 2) return out;
-  sh.getRange(2, 1, sh.getLastRow() - 1, 5).getValues().forEach(function (r) {
+  // Columns 1-8: Date, Ticker, Price, Fair value, Direction score, Setup, Setup strength, Analyst target.
+  sh.getRange(2, 1, sh.getLastRow() - 1, 8).getValues().forEach(function (r) {
     var d = r[0] instanceof Date ? dnum_(Utilities.formatDate(r[0], 'UTC', 'yyyy-MM-dd')) : null;
     if (d === null) return;
-    var age = today - d;
-    if (age < 60 || age > 120) return;
-    var t = String(r[1]).toUpperCase(), cur = out[t];
-    if (!cur || Math.abs(age - 90) < Math.abs(cur.age - 90)) out[t] = { age: age, fv: typeof r[3] === 'number' ? r[3] : null, score: r[4] };
+    var age = today - d, t = String(r[1]).toUpperCase();
+    var cur = out[t] || (out[t] = { age: null, fv: null, score: null, tgtOld: null, tgtAge: null });
+    // ~90 days back, for the fair value and direction comparisons that already used this.
+    if (age >= 60 && age <= 120 && (cur.age === null || Math.abs(age - 90) < Math.abs(cur.age - 90))) {
+      cur.age = age; cur.fv = typeof r[3] === 'number' ? r[3] : null; cur.score = r[4];
+    }
+    // ~30 days back, for the analyst target comparison. Targets move on news rather than on a quarterly
+    // cycle, so a month is the useful window; the snapshot is weekly, hence the tolerance.
+    // Widened from 21-75 to 14-120 days on 24 November 2026. With a weekly snapshot and a History tab only a
+    // few weeks old, the narrow window matched nothing and the column came out blank for all 396 rows - and a
+    // blank reads as "targets have not moved" rather than "this was never measured". tgtAge is reported beside
+    // it now so the distinction is visible.
+    if (age >= 14 && age <= 120 && typeof r[7] === 'number' && r[7] > 0 &&
+      (cur.tgtAge === null || Math.abs(age - 30) < Math.abs(cur.tgtAge - 30))) {
+      cur.tgtOld = r[7]; cur.tgtAge = age;
+    }
   });
   return out;
 }
@@ -1928,7 +2335,8 @@ var HOLDINGS_COLS = [
   ['Sector', 'Sector', '@', 120], ['Industry', 'Industry', '@', 170], ['Type', 'Type', '@', 100],
   ['Fair value (local)', 'Fair value', '#,##0.00', 90], ['Low', 'Low', '#,##0.00', 75], ['High', 'High', '#,##0.00', 75],
   ['Upside', 'Upside', '0.0%;[Red]-0.0%', 70], ['Exp. return a year (5 yrs)', 'Exp. 5-yr return (a year)', '0.0%;[Red]-0.0%', 85],
-  ['Direction', 'Direction', '@', 70], ['Status', 'Status', '@', 120], ['Review', null, '@', 240],
+  ['Direction', 'Direction', '@', 70], ['Strength (of 7)', 'Setup strength (of 7)', '0', 70],
+  ['Status', 'Status', '@', 120], ['Review', null, '@', 240],
   ['Analyst target', 'Analyst target', '#,##0.00', 85], ['PEG', 'PEG', '0.00', 60],
   ['Expectations gap', 'Expectations gap (implied - expected growth)', '+0.0%;[Red]-0.0%', 90],
   ['Model vs analysts', 'Model vs analysts', '+0%;[Red]-0%', 85],
@@ -2012,9 +2420,9 @@ var SETUP_COLS = [
 ];
 var SETUP_HELP = [
   ['What the setups mean', ''],
-  ['Value setup', 'At or below fair value, analysts see 15%+ upside (5+ analysts), estimates not being cut, Direction 60%+. A falling price does not block it: for long-term investors the best prices are often below trend.'],
-  ['Compounder', 'Looks expensive on fair value, but the price assumes less growth (Implied growth) than the company is delivering. ROIC 12%+, Direction 75%+, estimates rising, price above its 200-day average.'],
-  ['Quality pullback', 'Above fair value, but priced for less growth than it delivers. ROIC 12%+, estimates not being cut, analysts see 15%+ upside, and the price is 5%+ below its 200-day average. Often the chance to buy a strong performer on a dip.'],
+  ['Value setup', 'At or below fair value, analysts see 15%+ upside (5+ analysts), estimates not being cut, Direction 60%+. A falling price does not block it: for long-term investors the best prices are often below trend. Deep cyclicals must be further below fair value - see Margin of safety (cyclicals) on Assumptions.'],
+  ['Compounder', 'Looks expensive on fair value, but the price assumes less growth (Implied growth) than the company is delivering. ROIC 12%+, Direction 75%+, estimates rising, price above its 200-day average. Deep cyclicals never qualify: a refiner, miner or shipping name looks expensive because the cycle is high, not because the business compounds.'],
+  ['Quality pullback', 'Above fair value, but priced for less growth than it delivers. ROIC 12%+, estimates not being cut, analysts see 15%+ upside, and the price is 5%+ below its 200-day average. Often the chance to buy a strong performer on a dip. Deep cyclicals must also clear Margin of safety (cyclicals): for them a falling price may be the cycle turning.'],
   ['Value, estimates falling', 'Cheap, but analysts are cutting forecasts. The classic value-trap pattern: wait for forecasts to stop falling.'],
   ['Trend broken', 'A quality grower, not cheap, with the price 5%+ below its 200-day average and estimates no longer rising. For holdings: time to review or trim.'],
   ['High debt', 'Net debt over 3.5x EBITDA (6x for utilities), EBITDA under 3x interest, or net debt with no operating profit. Blocks the buy-type setups. Banks and insurers are excluded.'],
@@ -2067,9 +2475,11 @@ function writeSetups_(formulasOnly) {
    Target = best-ideas cap x (40% + 60% x conviction); conviction blends Strength, expected return, the
    expectations cushion and Direction. Cyclicals are capped lower. Below the 200-day average a position is
    built in thirds, at least N days apart (or sooner on a further 10% fall); above it, in one go.
-   Holdings with a warning are halved, then sold if the warning lasts N weekly snapshots. Stretched holdings
-   that no longer qualify, and anything over the hard cap, are trimmed to target. Unqualified and
-   speculative holdings are held without adding, and trimmed back if above 1.5x the speculative cap.
+   Holdings with a warning are halved, then sold if the warning lasts N weekly snapshots. Anything over the
+   hard cap is trimmed to target, and speculative holdings above 1.5x the speculative cap back to the cap -
+   both only if the stock is above its own 200-day average, so a position made overweight by the rest of the
+   portfolio falling is left alone. Valuation never triggers a sale: stretched holdings are flagged only.
+   Unqualified and speculative holdings are held without adding.
    New money only goes to qualifying stocks, best first; what is left stays in cash. */
 var ORDERS = { NAME: 'Orders', LOG: 'Order log', RULES: 'Rules' };
 var WARN_SETUPS = { 'Value, estimates falling': 1, 'Trend broken': 1, 'High debt': 1, 'Cash burner': 1 };
@@ -2082,11 +2492,47 @@ function portfolioSettings_() {
     return v === '' || v === undefined || v === null ? (row ? row[1] : null) : Number(v);
   };
   return { cash: g('Cash available (£)') || 0, reserve: g('Cash reserve'), maxBest: g('Max position (best ideas)'),
-    maxCyc: g('Max position (cyclical)'), maxSpec: g('Max position (speculative)'), maxInd: g('Max per industry'),
+    maxCyc: g('Max position (cyclical)'), maxSpec: g('Max position (speculative)'), maxInd: g('Max per industry'), maxTheme: g('Max per theme'),
     hardCap: g('Trim if any position above'), minPos: g('Min position'), minOrder: g('Minimum order (£)'), addDays: g('Days between adds'),
+    rotDir: num0_(m['Rotate out below direction'], 0.75), rotPace: num0_(m['Max rotation per week'], 0.05),
     warnWeeks: g('Weeks of warnings before selling'), pace: g('Max new money per week'), newPerWeek: g('Max new positions per week'), stretch: num0_(m['Stretched if 5-yr expected return below'], 0.06) };
 }
 function num0_(v, d) { return v === '' || v === undefined || v === null || isNaN(Number(v)) ? d : Number(v); }
+
+/**
+ * Themes group industries that rise and fall together, so one bet spread across several industry
+ * labels is still counted as one bet. Yahoo files the AI build-out under at least eight industries,
+ * so the per-industry cap never binds on it. Anything not listed falls back to its own industry.
+ */
+var THEME_BY_INDUSTRY = {
+  'Semiconductors': 'AI & data centre',
+  'Semiconductor Equipment & Materials': 'AI & data centre',
+  'Computer Hardware': 'AI & data centre',
+  'Electronic Components': 'AI & data centre',
+  'Communication Equipment': 'AI & data centre',
+  'Engineering & Construction': 'AI & data centre',
+  'Utilities - Independent Power Producers': 'AI & data centre',
+  'Electrical Equipment & Parts': 'AI & data centre',
+  'Banks - Diversified': 'Banks & insurers', 'Banks - Regional': 'Banks & insurers',
+  'Insurance - Diversified': 'Banks & insurers', 'Insurance - Life': 'Banks & insurers',
+  'Insurance - Property & Casualty': 'Banks & insurers', 'Asset Management': 'Banks & insurers',
+  'Capital Markets': 'Banks & insurers', 'Financial Data & Stock Exchanges': 'Banks & insurers',
+  'Oil & Gas Refining & Marketing': 'Energy', 'Oil & Gas E&P': 'Energy',
+  'Oil & Gas Midstream': 'Energy', 'Oil & Gas Integrated': 'Energy', 'Thermal Coal': 'Energy',
+  'Drug Manufacturers - General': 'Healthcare', 'Drug Manufacturers - Specialty & Generic': 'Healthcare',
+  'Healthcare Plans': 'Healthcare', 'Medical Devices': 'Healthcare', 'Biotechnology': 'Healthcare'
+};
+/**
+ * Stocks whose industry label hides what they actually are. Broad software and IT-services labels are
+ * deliberately NOT mapped wholesale: Microsoft and Palo Alto sit in the same Yahoo industry as Palantir
+ * and CoreWeave but are not data-centre build-out bets, so the AI-native ones are named here instead.
+ */
+var THEME_BY_TICKER = { IREN: 'AI & data centre', CRWV: 'AI & data centre', CORZ: 'AI & data centre',
+  APLD: 'AI & data centre', PLTR: 'AI & data centre', BBAI: 'AI & data centre', SOUN: 'AI & data centre',
+  SMCI: 'AI & data centre', VRT: 'AI & data centre', STRL: 'AI & data centre', BE: 'AI & data centre' };
+function themeFor_(v) {
+  return THEME_BY_TICKER[v.ticker] || THEME_BY_INDUSTRY[v.industry] || v.industry || v.sector || 'Other';
+}
 
 /** Price of one share in pounds. */
 function toGBP_(price, ccy, fxUsd, fx) {
@@ -2114,17 +2560,23 @@ function planPortfolio_(out, market, S, tv) {
   if (!(total > 0)) return [];
   // Warning streaks (weekly History snapshots) and the order log
   var warnWeeks = warningStreaks_(), log = orderLogIndex_();
-  var byInd = {};
+  var byInd = {}, byTheme = {};
   out.forEach(function (v) {
     var m = market[v.ticker] || {};
     v.priceGBP = toGBP_(m.price, m.currency, fxUsd, fx); v.localPrice = m.price; v.localCcy = m.currency || '';
     var h = hold[v.ticker]; v.valueNow = h ? h.value : 0; v.weightNow = v.valueNow / total;
+    // A position can become overweight two ways: it rose, or everything else fell. Only the first is
+    // a reason to trim. A stock above its own 200-day average has genuinely risen; one below it has not.
+    v.grewByRising = v.vs200 === null || v.vs200 === undefined ? true : v.vs200 > 0;
     var ind = v.industry || v.sector || 'Other'; byInd[ind] = (byInd[ind] || 0) + v.weightNow; v.indKey = ind;
+    // Theme share is measured against invested money, not the whole portfolio: cash is not a bet, and
+    // a cap against the total would read as "safe" simply because a lot is sitting uninvested.
+    var th = themeFor_(v); byTheme[th] = (byTheme[th] || 0) + v.valueNow; v.themeKey = th;
   });
   var clip = function (x) { return Math.max(0, Math.min(1, x)); };
   // Pass 1: which stocks qualify, and their stand-alone targets.
   var isBuyType = function (v) { return v.setup === 'Value setup' || v.setup === 'Compounder' || v.setup === 'Quality pullback'; };
-  var sumQ = 0, heldOther = 0;
+  var sumQ = 0, heldOther = 0, rotPool = 0;
   out.forEach(function (v) {
     var sAdj = (v.setupScore || 0) + (v.trendUp === true ? 0 : 1);
     var gp = typeof v.expGap === 'number' ? v.expGap : null;
@@ -2136,23 +2588,47 @@ function planPortfolio_(out, market, S, tv) {
       // cushion, half each). In the back-test quality lined up with later returns; cheapness alone did not.
       var cv = 0.30 * (v.quality === null || v.quality === undefined ? 0.5 : v.quality) + 0.25 * clip((sAdj - 5) / 2) +
         0.20 * clip(((v.scorePct || 0) - 0.75) / 0.25) + 0.125 * clip(((v.expRet || 0.1) - 0.10) / 0.15) + 0.125 * clip(-(gp || 0) / 0.3);
-      v._t = (v.deepCyclical ? P.maxCyc : P.maxBest) * (0.4 + 0.6 * cv);
+      v._t = (v.deepCyclical ? P.maxCyc : P.maxBest) * (0.4 + 0.6 * cv); v._cv = cv;
       sumQ += v._t;
-    } else if (v.valueNow > 0) heldOther += v.weightNow;
+    } else if (v.valueNow > 0) {
+      // Rotation: a holding earmarked to make room for better ideas. It must fail on the BUSINESS, not on
+      // price - weak and worsening signals AND a failed quality gate. A holding whose business is still
+      // improving is never rotated out however expensive it looks, which is what protects the big winners.
+      // ETFs and anything without signals are left alone: no data is not the same as bad data.
+      var hasSignals = v.scorePct !== null && v.scorePct !== undefined && v.quality !== null && v.quality !== undefined;
+      v._rotate = P.rotDir > 0 && hasSignals && v.type !== 'ETF' && !isBuyType(v) &&
+        v.scorePct < P.rotDir && v.qualityOK === false;
+      if (v._rotate) rotPool += v.weightNow; else heldOther += v.weightNow;
+    }
   });
   // Targets must fit in the portfolio: what is left after the cash reserve and the holdings that do not
   // qualify is shared among qualifying stocks in proportion to conviction (best ideas still get the most).
   var room = Math.max(0, 1 - P.reserve - heldOther);
-  // Keep only as many qualifiers (strongest first) as fit at the minimum position size or more.
-  var Q = out.filter(function (v) { return v._q; }).sort(function (a, b) { return b._t - a._t; });
+  // Keep only as many qualifiers as fit at the minimum position size or more, dropping the LOWEST
+  // CONVICTION first. Ordering the drops by target weight instead would cut cyclicals first whatever
+  // their signals, because their cap is smaller by rule: the strongest name in the book could be
+  // dropped for one of the weakest. The cap limits how much of a cyclical you own, not whether you own it.
+  var Q = out.filter(function (v) { return v._q; }).sort(function (a, b) { return b._cv - a._cv; });
   var scale = 1;
   while (Q.length) {
     var sum = Q.reduce(function (a, v) { return a + v._t; }, 0);
     scale = sum > room ? room / sum : 1;
-    if (Q.length === 1 || Q[Q.length - 1]._t * scale >= P.minPos) break;
+    // Every survivor must still clear the minimum, not just the last one: sorted by conviction, the
+    // smallest target can sit anywhere in the list.
+    var smallest = Q.reduce(function (a, v) { return Math.min(a, v._t); }, Infinity);
+    if (Q.length === 1 || smallest * scale >= P.minPos) break;
     var drop = Q.pop(); drop._q = false; drop._ranked = Q.length;
   }
   if (!Q.length) scale = 0;
+  // Share this week's rotation allowance among the earmarked holdings, weakest business first, in thirds
+  // (whole if the stake is small). The book turns over gradually rather than in one clear-out.
+  var rotLeft = P.rotDir > 0 ? P.rotPace * total : 0;
+  out.filter(function (v) { return v._rotate; }).sort(function (a, b) { return (a.scorePct || 0) - (b.scorePct || 0); })
+    .forEach(function (v) {
+      if (rotLeft < P.minOrder) { v._rotAmt = 0; return; }
+      var want = v.valueNow <= P.minOrder * 2 ? v.valueNow : v.valueNow / 3;
+      v._rotAmt = Math.min(want, rotLeft); rotLeft -= v._rotAmt;
+    });
   var orders = [], sells = 0;
   out.forEach(function (v) {
     v.action = ''; v.targetW = ''; v.orderGBP = ''; v.actionWhy = '';
@@ -2179,13 +2655,32 @@ function planPortfolio_(out, market, S, tv) {
         else if (!trimmedSince) { amt = v.valueNow / 2; v.action = 'Trim'; why.push(v.setup, 'first warning: halve'); }
         else { v.action = 'Hold'; why.push('Warning (' + v.setup + '), already halved; sell if it lasts ' + P.warnWeeks + ' weeks'); }
         v.targetW = amt === v.valueNow ? 0 : (v.valueNow - amt) / total;
-      } else if (v.weightNow > P.hardCap) {
+      } else if (v._rotate && v._rotAmt > 0) {
+        amt = v._rotAmt;
+        v.action = amt >= v.valueNow - 1 ? 'Sell' : 'Trim';
+        why.push('Rotating out to fund stronger ideas: direction ' + Math.round((v.scorePct || 0) * 100) + '%, ' + String(v.qualityGate || '').replace('Fail: ', '') + ', no buy setup');
+        v.targetW = (v.valueNow - amt) / total;
+      } else if (v._rotate) {
+        v.action = 'Hold';
+        v.actionWhy = why.concat(['Earmarked to rotate out (direction ' + Math.round((v.scorePct || 0) * 100) + '%, quality gate failed); this week\'s rotation limit is used up']).join('; ');
+        return;
+      } else if (v.weightNow > P.hardCap && v.grewByRising) {
         var tgt = qualifies ? Math.min(v.targetW, P.hardCap) : P.maxBest;
         amt = v.valueNow - tgt * total; v.action = 'Trim'; why.push('Over ' + Math.round(P.hardCap * 100) + '% of the portfolio');
+      } else if (v.weightNow > P.hardCap) {
+        // Overweight, but the stock itself has not risen: the rest of the portfolio fell around it.
+        // Trimming here would sell a holding for someone else's bad quarter, so leave it be.
+        v.action = 'Hold';
+        v.actionWhy = why.concat(['Over ' + Math.round(P.hardCap * 100) + '% of the portfolio, but below its own 200-day average, so it is overweight because the rest of the portfolio fell rather than because it rose: not trimmed']).join('; ');
+        return;
       } else if (!qualifies && !buyType && (v.scorePct || 0) < 0.75 && typeof v.expRet === 'number' && v.expRet < P.stretch && v.weightNow > P.maxSpec) {
-        amt = v.valueNow / 3; v.action = 'Trim'; why.push('Stretched (expected return ' + Math.round(v.expRet * 100) + '% a year), no buy setup and business not improving strongly: trim a third');
-        v.targetW = (v.valueNow - amt) / total;
-      } else if (!qualifies && (v.speculative || v.thinTargets || v.type === 'Pre-profit') && v.weightNow > 1.5 * P.maxSpec) {
+        // Flagged, not sold. Back-testing found no evidence that a low expected return predicts
+        // underperformance: the same test sold AMD at +305%, Palantir at +1,106% and IREN at +583%
+        // still to come. The status stays visible on Holdings; the decision is the user's.
+        v.action = 'Hold';
+        v.actionWhy = why.concat(['Stretched (expected return ' + Math.round(v.expRet * 100) + '% a year), no buy setup and business not improving strongly. Flagged only - valuation alone does not trigger a sale']).join('; ');
+        return;
+      } else if (!qualifies && (v.speculative || v.thinTargets || v.type === 'Pre-profit') && v.weightNow > 1.5 * P.maxSpec && v.grewByRising) {
         amt = v.valueNow - P.maxSpec * total; v.action = 'Trim'; why.push('Speculative: trim to ' + (P.maxSpec * 100).toFixed(1) + '% cap');
         v.targetW = P.maxSpec;
       }
@@ -2205,7 +2700,9 @@ function planPortfolio_(out, market, S, tv) {
       if (!stepOK) { v.action = held ? 'Hold' : 'Wait'; v.actionWhy = 'Next third due ' + (P.addDays - last.days) + ' days after last buy (or on a 10% fall)'; return; }
       var w = v.trendUp === true ? gapW : Math.min(gapW, tranche);
       v.action = held ? 'Add' : 'Buy';
-      v.pendingW = w; v.priority = v.targetW;
+      // Fund the strongest ideas first, not the biggest intended positions: a cyclical's smaller cap must
+      // not push it down the queue, for the same reason it must not decide whether it gets in at all.
+      v.pendingW = w; v.priority = v._cv !== undefined ? v._cv : v.targetW;
       v.actionWhy = why.concat(v.trendUp === true ? ['above 200-day average: full position'] : ['below 200-day average: building in thirds']).join('; ');
       return;
     }
@@ -2225,20 +2722,41 @@ function planPortfolio_(out, market, S, tv) {
     if (allowance < budget) { budget = allowance; paceNote = 'weekly pace limit'; }
   }
   var newLeft = P.newPerWeek === null ? 99 : Math.max(0, P.newPerWeek - wk.newCount);
+  // The base the theme cap is measured against: the money that will be at work once this plan runs, which
+  // is what is left invested after the sales plus the cash this plan spends. A running total measured
+  // part-way through the loop breaks in two ways: on an all-cash start the first buy sees a base of nothing
+  // and every theme reads as full at 0%, and a plan that sells most of the book caps whatever replaces it
+  // long before the cap is really reached.
+  var investedRun = Math.max(1, invested - sells + Math.max(0, budget));
   out.filter(function (v) { return v.pendingW > 0; }).sort(function (a, b) { return b.priority - a.priority; }).forEach(function (v) {
     var wantW = v.pendingW, room = P.maxInd - (byInd[v.indKey] || 0);
     if (v.valueNow === 0 && newLeft <= 0) { v.action = 'Wait'; v.actionWhy = 'Qualifies; new-position limit for this week reached'; return; }
     if (room <= 0) { v.action = 'Wait'; v.actionWhy = 'Industry at its ' + Math.round(P.maxInd * 100) + '% cap'; return; }
     var gbp = Math.min(wantW, room) * total;
     if (gbp > budget) gbp = budget;
+    // Theme cap, measured against that base. Cash held is not a bet, but cash this plan spends is, so the
+    // base does not move as the loop fills orders and the room left is simply the cap less what is there.
+    if (P.maxTheme !== null && P.maxTheme < 1) {
+      var themeGBP = byTheme[v.themeKey] || 0;
+      var themeMax = P.maxTheme * investedRun - themeGBP;
+      if (themeMax < P.minOrder) {
+        v.action = v.valueNow > 0 ? 'Hold' : 'Wait';
+        v.actionWhy = v.themeKey + ' is at ' + Math.round(themeGBP / investedRun * 100) + '% of invested money, its ' + Math.round(P.maxTheme * 100) + '% cap: no more added to this theme (nothing is sold to get under it)';
+        return;
+      }
+      if (gbp > themeMax) gbp = themeMax;
+    }
     if (gbp < P.minOrder) { v.action = v.valueNow > 0 ? 'Hold' : 'Wait'; v.actionWhy = budget < P.minOrder ? (paceNote ? 'Qualifies; this week\'s pace limit is used up' : 'Qualifies, but no cash left after reserve') : 'Order below minimum'; return; }
     budget -= gbp; if (v.valueNow === 0) newLeft--; byInd[v.indKey] = (byInd[v.indKey] || 0) + gbp / total;
+    byTheme[v.themeKey] = (byTheme[v.themeKey] || 0) + gbp;
     v.orderGBP = gbp;
     orders.push({ action: v.action, v: v, gbp: gbp, why: v.actionWhy });
   });
   orders.sort(function (a, b) { var o = { Sell: 0, Trim: 1, Buy: 2, Add: 3 }; return o[a.action] - o[b.action] || Math.abs(b.gbp) - Math.abs(a.gbp); });
   orders.meta = { scale: scale, qualifiers: out.filter(function (v) { return v._q; }).length, total: total, cash: P.cash, invested: invested, reserve: P.reserve * total, sells: sells,
-    buys: orders.filter(function (o) { return o.gbp > 0; }).reduce(function (a, o) { return a + o.gbp; }, 0) };
+    buys: orders.filter(function (o) { return o.gbp > 0; }).reduce(function (a, o) { return a + o.gbp; }, 0),
+    themes: Object.keys(byTheme).map(function (k) { return [k, byTheme[k] / investedRun]; }).filter(function (r) { return r[1] >= 0.03; })
+      .sort(function (a, b) { return b[1] - a[1]; }).slice(0, 5), maxTheme: P.maxTheme };
   return orders;
 }
 
@@ -2304,9 +2822,11 @@ function writeOrders_(orders) {
     ['Cash reserve kept (£)', M.reserve || ''], ['Sells and trims (£)', M.sells || 0], ['Buys and adds (£)', M.buys || 0],
     ['Cash after buys (£)', (M.cash || 0) - (M.buys || 0)], ['Cash after sells are done (£)', (M.cash || 0) - (M.buys || 0) + (M.sells || 0)], ['Updated', new Date()],
     ['Stocks in the plan', M.qualifiers || 0],
-    ['Targets scaled to fit', M.scale !== undefined && M.scale < 1 ? Math.round(M.scale * 100) + '% of stand-alone size' : 'No'], ['', ''],
+    ['Targets scaled to fit', M.scale !== undefined && M.scale < 1 ? Math.round(M.scale * 100) + '% of stand-alone size' : 'No'], ['', '']]
+    .concat((M.themes || []).length ? [['Themes after these orders', 'Cap ' + Math.round((M.maxTheme || 0) * 100) + '%, buys only']]
+      .concat(M.themes.map(function (r) { return ['  ' + r[0], Math.round(r[1] * 100) + '% of invested']; })).concat([['', '']]) : []).concat([
     ['How to use', 'Place each order, then tick Done.'], ['', 'Holdings and Cash available update automatically.'],
-    ['', 'Correct shares or cash if the fill differed.'], ['', 'Rules and limits: Rules tab and Assumptions.']];
+    ['', 'Correct shares or cash if the fill differed.'], ['', 'Rules and limits: Rules tab and Assumptions.']]);
   sh.getRange(1, sc, summary.length, 2).setValues(summary);
   sh.getRange(2, sc + 1, 8, 1).setNumberFormat('£#,##0');
   sh.getRange(1, sc, 1, 2).setFontWeight('bold');
@@ -2364,8 +2884,9 @@ var RULES_TEXT = [
   ['5. Buy', 'Above the 200-day average: buy the full target. Below it: buy a third now, the next third after the set number of days or on a further 10% fall.'],
   ['6. Cash', 'Money goes to qualifying stocks, strongest first, keeping the cash reserve and the per-industry cap. A pace limit spreads it over weeks: at most the set share of cash, and the set number of new positions, in any 7 days. Anything left stays in cash until the next opportunity.'],
   ['7. Warnings', 'Value, estimates falling / Trend broken / High debt / Cash burner on a holding: halve it, then sell the rest if the warning lasts the set number of weeks.'],
-  ['8. Trims', 'Any holding above the hard cap is trimmed to target. Stretched holdings (expected return below the Stretched level) with no buy setup and Direction under 75% are trimmed by a third: winners whose business is still improving strongly are left to run. Speculative holdings above 1.5x the speculative cap are trimmed to the cap.'],
-  ['9. Hold', 'Everything else is held. Unqualified holdings are never added to.'],
+  ['8. Rotation', 'A holding with no buy setup, business signals below the Rotate out below direction level AND a failed quality gate is sold in stages (thirds, weakest business first) to make room for stronger ideas, within Max rotation per week. Its weight stops counting against the room for new buys, so the strongest ideas can be funded. A holding whose business is still improving is never rotated out however expensive it looks: rotation is about the business deteriorating, not the price being high. ETFs and holdings without signals are left alone.'],
+  ['9. Trims', 'Only three things trigger a sale: a warning setup (estimates falling, trend broken, cash burner), a holding above the hard cap, and a speculative holding above 1.5x the speculative cap. The last two also require the stock to be above its own 200-day average, so a position that became overweight because the rest of the portfolio fell is left alone. Valuation never triggers a sale: stretched holdings are flagged on Holdings and left for you to judge. Back-testing found a valuation-based sell rule would have sold AMD, Palantir and IREN with 305%, 1,106% and 583% still to come.'],
+  ['10. Hold', 'Everything else is held. Unqualified holdings are never added to.'],
   ['', ''],
   ['Your routine', 'Check the Orders tab after the morning data update. Place the orders, tick Done. Nothing else is needed; change the limits on Assumptions if you want a different style.'],
   ['', ''],
@@ -2565,6 +3086,26 @@ function svPickerRules_(sh) {
 }
 
 /** Builds (or rebuilds) the Stock view tab: layout, helper tables and charts. */
+/**
+ * Points the ticker picker at the Pick label column as it stands right now, and reselects the stock in C2.
+ * Called on every recalculation, not only when the tab is rebuilt: the validation holds a column REFERENCE, so
+ * inserting columns into Calc silently leaves it aimed at whatever has taken that letter. Adding the scenario
+ * columns moved Pick label 26 places and the picker went on offering the old column's contents, which looked
+ * like a list that had lost most of its tickers.
+ */
+function setPicker_(sh, keep) {
+  var ss = SpreadsheetApp.getActive(), calc = ss.getSheetByName(SHEET2.CALC);
+  if (!sh || !calc) return;
+  var pickCol = calcL_('Pick label');
+  var src = pickCol ? calc.getRange(pickCol + '2:' + pickCol + '2000') : calc.getRange('A2:A2000');
+  var rule = SpreadsheetApp.newDataValidation().requireValueInRange(src, true).setAllowInvalid(true).build();
+  var cur = keep === undefined ? String(sh.getRange(SV.TICKER).getValue() || '').trim() : keep;
+  var start = cur ? svLabelFor_(String(cur).trim().split(/\s+/).pop().toUpperCase())
+    : (calc.getLastRow() > 1 ? src.getCell(1, 1).getValue() : '');
+  sh.getRange(SV.TICKER).setDataValidation(rule).setFontWeight('bold').setFontSize(12).setBackground('#FFF4CC')
+    .setNote(SETUP_LEGEND).setValue(start);
+}
+
 function buildStockView_() {
   var ss = SpreadsheetApp.getActive();
   var sh = ss.getSheetByName(SV.NAME) || ss.insertSheet(SV.NAME);
@@ -2585,13 +3126,7 @@ function buildStockView_() {
   // Header and selector
   sh.getRange('B2').setValue('Stock').setFontColor('#5F5E5A');
   var calc = ss.getSheetByName(SHEET2.CALC);
-  var pickCol = calcL_('Pick label');
-  var src = pickCol ? calc.getRange(pickCol + '2:' + pickCol + '2000') : calc.getRange('A2:A2000');
-  var rule = SpreadsheetApp.newDataValidation().requireValueInRange(src, true).setAllowInvalid(true).build();
-  var start = keep ? svLabelFor_(String(keep).trim().split(/\s+/).pop().toUpperCase())
-    : (calc.getLastRow() > 1 ? src.getCell(1, 1).getValue() : '');
-  sh.getRange(SV.TICKER).setDataValidation(rule).setFontWeight('bold').setFontSize(12).setBackground('#FFF4CC')
-    .setNote(SETUP_LEGEND).setValue(start);
+  setPicker_(sh, keep);
   sh.getRange('D2:K2').merge().getCell(1, 1).setFormula('=' + svLook_(SHEET2.CALC, 'Name')).setFontSize(16).setFontWeight('bold');
   sh.getRange('D3:K3').merge().getCell(1, 1).setFormula('=TEXTJOIN("  ·  ",TRUE,' + svLook_(SHEET2.CALC, 'Sector') + ',' + svLook_(SHEET2.CALC, 'Industry') + ',' +
     svLook_(SHEET2.CALC, 'Type') + ',' + svLook_(SHEET2.CALC, 'List') + ',IF(' + svLook_(SHEET2.CALC, 'Currency') + '="","","Prices in "&' + svLook_(SHEET2.CALC, 'Currency') + '))').setFontColor('#5F5E5A');
@@ -2619,6 +3154,7 @@ function buildStockView_() {
   sh.getRange('C7:R7').merge().getCell(1, 1).setFormula('=' + svLook_(SHEET2.CALC, 'Notes')).setFontColor('#888780').setFontSize(9).setWrap(true);
   sh.setRowHeight(7, 30);
 
+
   // Section headings
   var head = function (a1, text) { sh.getRange(a1).setValue(text).setFontWeight('bold').setFontColor('#444441'); };
   head('B9', '1 · Where the price sits'); head('J9', '2 · What each model says'); head('R9', 'Your position');
@@ -2626,7 +3162,7 @@ function buildStockView_() {
   head('R28', '5 · Price over 1 year');
   head('B47', '6 · Margins (% of revenue)'); head('J47', '7 · Next-year EPS estimate: how it has moved');
   head('R47', 'Sensitivity: fair value at different growth and discount rates');
-  head('B66', 'Signals'); head('R66', 'Your notes (saved per stock)');
+  head('B66', 'Signals');
 
   // Your position (from Holdings)
   var pos = [['Shares', 'Shares', '#,##0.####'], ['Avg cost (£)', 'Avg cost (£)', '£#,##0.00'], ['Cost (£)', 'Cost (£)', '£#,##0'],
@@ -2753,9 +3289,86 @@ function buildStockView_() {
     '&"     Last EPS surprise: "&IFERROR(TEXT(' + svLook_(SHEET2.CALC, 'Last EPS surprise') + ',"+0.0%;-0.0%"),"n/a")' +
     '&"     Revisions (30 days): "&' + svLook_(SHEET2.CALC, 'Analyst revisions 30d')).setFontColor('#5F5E5A');
 
-  // Notes box
-  sh.getRange(SV.NOTE_RANGE).merge().setBackground('#FFF4CC').setVerticalAlignment('top').setWrap(true)
-    .setBorder(true, true, true, true, false, false, '#D3D1C7', SpreadsheetApp.BorderStyle.SOLID);
+  // Bear, base and bull. The five-year prices come from the earnings model; the fair values are those cases as a
+  // ratio to the base, applied to the blended fair value, so the right-hand column is on the same footing as the
+  // Upside card at the top of this tab. Left blank for a financial, which has no revenue-and-margin projection.
+  head('B70', '8 · Bear, base and bull (automated)');
+  // Section 8 is the automated case, start to finish: measured drivers, measured prices and the automatic
+  // probabilities. An adjustment never rewrites it - it gets its own table alongside, so the two can be read
+  // against each other. Base and de-rated are the same in both, since neither is adjustable.
+  var scen = [['Bear', 'Bear 5-yr price (measured)', 'Bear fair value (measured)'],
+    ['Base (expected)', '5-yr price (earnings model)', 'Fair value'],
+    ['Bull', 'Bull 5-yr price (measured)', 'Bull fair value (measured)'],
+    ['De-rated (exit P/E 12)', 'De-rated 5-yr price (exit P/E 12)', 'De-rated fair value'],
+    ['Probability-weighted', '', 'Scenario fair value (measured)']];
+  sh.getRange('B71').setValue('Case').setFontColor('#5F5E5A');
+  sh.getRange('D71').setValue('5-yr price').setFontColor('#5F5E5A').setHorizontalAlignment('right');
+  sh.getRange('F71').setValue('Fair value').setFontColor('#5F5E5A').setHorizontalAlignment('right');
+  sh.getRange('H71').setValue('vs price today').setFontColor('#5F5E5A').setHorizontalAlignment('right');
+  scen.forEach(function (s, i) {
+    var r = 72 + i, bold = s[0] === 'Base (expected)' || s[0] === 'Probability-weighted';
+    sh.getRange(r, 2, 1, 2).merge().getCell(1, 1).setValue(s[0]).setFontWeight(bold ? 'bold' : 'normal');
+    sh.getRange(r, 4, 1, 2).merge().getCell(1, 1).setFormula(s[1] ? '=IFERROR(1/(1/' + svLook_(SHEET2.CALC, s[1]) + '),"")' : '')
+      .setNumberFormat('#,##0.00').setHorizontalAlignment('right');
+    var fvCell = svLook_(SHEET2.CALC, s[2]);
+    sh.getRange(r, 6, 1, 2).merge().getCell(1, 1).setFormula('=IFERROR(1/(1/' + fvCell + '),"")')
+      .setNumberFormat('#,##0.00').setHorizontalAlignment('right').setFontWeight(bold ? 'bold' : 'normal');
+    sh.getRange(r, 8, 1, 2).merge().getCell(1, 1)
+      .setFormula('=IF(OR(' + fvCell + '="",N(' + svLook_(SHEET2.CALC, 'Price') + ')<=0),"",' + fvCell + '/' + svLook_(SHEET2.CALC, 'Price') + '-1)')
+      .setNumberFormat('+0%;[Red]-0%').setHorizontalAlignment('right').setFontWeight(bold ? 'bold' : 'normal');
+  });
+  sh.getRange('B77:P77').merge().getCell(1, 1).setFormula('=IF(' + svLook_(SHEET2.CALC, 'Scenario drivers used') + '="","Scenarios are not calculated for this type.",' +
+    '"Probabilities (bear/base/bull): "&' + svLook_(SHEET2.CALC, 'Scenario probabilities (measured)') +
+    '&"     Span bull to worst case: "&TEXT(' + svLook_(SHEET2.CALC, 'Scenario span (measured)') + ',"0.0")&"x")').setFontColor('#5F5E5A');
+  // The drivers, always shown. Where the Scenarios tab has adjusted them, the measured calculation and the
+  // stated reason follow underneath, so an adjustment is read next to the figure it replaced rather than instead
+  // of it. Renaming this column to 'Scenario drivers used' is what silently emptied this line once already.
+  // The bear margin against what analysts already forecast, on the line underneath. Without it a bear case can
+  // sit at or above the base case and read as diligence: 12 of the 294 names with a consensus margin are in
+  // exactly that position, Meta among them, and nothing in the sheet said so before 24 November 2026.
+  sh.getRange('B78:P80').merge().getCell(1, 1)
+    .setFormula('=' + svLook_(SHEET2.CALC, 'Scenario drivers measured') +
+      '&IF(' + svLook_(SHEET2.CALC, 'Bear margin vs consensus') + '="","",CHAR(10)&' +
+      svLook_(SHEET2.CALC, 'Bear margin vs consensus') + ')')
+    .setFontColor('#888780').setFontSize(9).setWrap(true).setVerticalAlignment('top');
+  sh.getRange('J70:P70').merge().getCell(1, 1).setFormula('="Worse of the two downside cases: "&' +
+    'IFERROR(TEXT(' + svLook_(SHEET2.CALC, 'Downside (worse case, measured)') + ',"+0%;-0%"),"n/a")').setFontWeight('bold').setFontColor('#791F1F');
+
+  // 8b, alongside: the same five cases on the drivers set by hand on the Scenarios tab. Every cell is blank
+  // until that stock has a row there, so for all but a handful of holdings this space simply reads empty. It
+  // sits beside the automated table rather than under it so the two can be compared line by line, which is the
+  // only reason to record an adjustment at all.
+  var adjIf = function (inner) {
+    return '=IF(' + svLook_(SHEET2.CALC, 'Scenario adjusted') + '="","",' + inner + ')';
+  };
+  sh.getRange('R70:X70').merge().getCell(1, 1)
+    .setFormula(adjIf('"8b · Adjusted on the Scenarios tab"')).setFontWeight('bold').setFontColor('#444441');
+  sh.getRange('R71').setFormula(adjIf('"Case"')).setFontColor('#5F5E5A');
+  sh.getRange('T71').setFormula(adjIf('"5-yr price"')).setFontColor('#5F5E5A').setHorizontalAlignment('right');
+  sh.getRange('V71').setFormula(adjIf('"Fair value"')).setFontColor('#5F5E5A').setHorizontalAlignment('right');
+  sh.getRange('W71').setFormula(adjIf('"vs price today"')).setFontColor('#5F5E5A').setHorizontalAlignment('right');
+  var adj = [['Bear', 'Bear 5-yr price', 'Bear fair value'], ['Base (expected)', '5-yr price (earnings model)', 'Fair value'],
+    ['Bull', 'Bull 5-yr price', 'Bull fair value'], ['De-rated (exit P/E 12)', 'De-rated 5-yr price (exit P/E 12)', 'De-rated fair value'],
+    ['Probability-weighted', '', 'Scenario fair value']];
+  adj.forEach(function (a, i) {
+    var r = 72 + i, bold = a[0] === 'Base (expected)' || a[0] === 'Probability-weighted';
+    sh.getRange(r, 18, 1, 2).merge().getCell(1, 1).setFormula(adjIf('"' + a[0] + '"')).setFontWeight(bold ? 'bold' : 'normal');
+    sh.getRange(r, 20, 1, 2).merge().getCell(1, 1)
+      .setFormula(a[1] ? adjIf('IFERROR(1/(1/' + svLook_(SHEET2.CALC, a[1]) + '),"")') : '')
+      .setNumberFormat('#,##0.00').setHorizontalAlignment('right');
+    var fvA = svLook_(SHEET2.CALC, a[2]);
+    sh.getRange(r, 22).setFormula(adjIf('IFERROR(1/(1/' + fvA + '),"")'))
+      .setNumberFormat('#,##0.00').setHorizontalAlignment('right').setFontWeight(bold ? 'bold' : 'normal');
+    sh.getRange(r, 23, 1, 2).merge().getCell(1, 1)
+      .setFormula(adjIf('IF(OR(' + fvA + '="",N(' + svLook_(SHEET2.CALC, 'Price') + ')<=0),"",' + fvA + '/' + svLook_(SHEET2.CALC, 'Price') + '-1)'))
+      .setNumberFormat('+0%;[Red]-0%').setHorizontalAlignment('right').setFontWeight(bold ? 'bold' : 'normal');
+  });
+  sh.getRange('R77:X77').merge().getCell(1, 1).setFormula(adjIf(
+    '"Probabilities (bear/base/bull): "&' + svLook_(SHEET2.CALC, 'Scenario probabilities (bear/base/bull)') +
+    '&"     Worse downside: "&IFERROR(TEXT(' + svLook_(SHEET2.CALC, 'Downside (worse case)') + ',"+0%;-0%"),"n/a")')).setFontColor('#5F5E5A');
+  sh.getRange('R78:X80').merge().getCell(1, 1).setFormula(adjIf(
+    svLook_(SHEET2.CALC, 'Scenario drivers used') + '&CHAR(10)&"Reason: "&' + svLook_(SHEET2.CALC, 'Reason for the adjustment')))
+    .setFontColor('#888780').setFontSize(9).setWrap(true).setVerticalAlignment('top');
   sh.setFrozenRows(3);
   renderStockView_();
 }
@@ -2789,7 +3402,6 @@ function renderStockView_() {
   var t = svTicker_(sh);
   // Keep the picker's marker in step with the stock's current setup (this runs after every data refresh).
   if (t) { var lbl = svLabelFor_(t); if (lbl && lbl !== String(sh.getRange(SV.TICKER).getValue()).trim()) sh.getRange(SV.TICKER).setValue(lbl); }
-  sh.getRange(SV.NOTE_CELL).setValue(t ? getNote_(t) : '');
   var grid = t ? sensitivityFor_(t) : null;
   var G0 = SV.GRID_ROW, C0 = SV.GRID_COL;
   var area = sh.getRange(G0, C0, 10, 8);
@@ -2893,5 +3505,5 @@ function openInStockView() {
 
 /* Lets the parsing functions be tested outside Google (ignored by Apps Script). */
 if (typeof module !== 'undefined') {
-  module.exports = { TAGS: TAGS, valueCompany: valueCompany, settingsFromMap_: settingsFromMap_, dnum_: dnum_, CALC_COLS: CALC_COLS, parseCompany: parseCompany, parseCsv: parseCsv, buildRawRows: buildRawRows, RAW_COLS: RAW_COLS };
+  module.exports = { growthPath_: growthPath_, grow_: grow_, TAGS: TAGS, valueCompany: valueCompany, settingsFromMap_: settingsFromMap_, dnum_: dnum_, CALC_COLS: CALC_COLS, parseCompany: parseCompany, parseCsv: parseCsv, buildRawRows: buildRawRows, RAW_COLS: RAW_COLS };
 }
