@@ -1322,6 +1322,22 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   var fcfMarginAvg = margins(function (i) { var o = fy('OCF', i), c = fy('Capex', i) || 0; return o === null ? null : o - c; });
   var netMarginNow = ni !== null && rev ? ni / rev : null;
   var netMarginAvg = margins(function (i) { return fy('NetIncome', i); });
+  // Consensus implied net margin at the analysts' second forecast year: their EPS and revenue for that year
+  // measured against the latest 12 months. This is the one number the sheet never held, and its absence let a
+  // bear case be set at the base case without anything saying so - PBF's bear margin was put at 2% on
+  // 24 November 2026 when 2% was what analysts expected, and only a screenshot caught it.
+  //   Analysts' EPS is per quoted share, so it is compared with the model's own EPS (net income / the share
+  // count used everywhere else) and never with the filed 'EPS TTM'. Where those two share bases differ the
+  // mix is silently wrong by that factor: SanDisk files 7.4x the quoted count, which turns a 67% margin into
+  // 9%. Revenue cancels its own currency; EPS does not, hence the fx on it.
+  out.consRevGrowth = gCons;
+  out.consMargin = null;
+  if (consensus && estEps2 !== null && eps !== null && eps > 0 && estRev2 > 0 && rev > 0 && netMarginNow !== null) {
+    var cm = netMarginNow * (estEps2 * fx / eps) / (estRev2 / rev);
+    if (isFinite(cm) && cm > -1 && cm < 0.95) out.consMargin = cm;
+    else out.notes.push('Consensus implied margin came out at ' + Math.round(cm * 100) +
+      '%: analysts\' EPS and revenue are on different bases, so it is not shown');
+  }
   var ovM = n_(ovr.margin);
   if (ovM !== null && ovM > 1.5) ovM = ovM / 100;
   // Long-run margins: average of the latest 12 months and the last 3 fiscal years
@@ -1540,6 +1556,16 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
       gLo = Math.min(gLo, g0); gHi = Math.max(gHi, g0);
       mLo = Math.min(mLo, mN); mHi = Math.max(mHi, mN);
       var set_ = function (x) { return x !== null && x !== undefined; };
+      // The check that was missing. A bear margin at or above what analysts already forecast is not a bear
+      // case, whoever wrote it and however carefully it was researched. The comparison is shown either way,
+      // because the two consensus horizons disagree - Yahoo's second forecast year put PBF at 5.6% while
+      // Simply Wall St's three-year rate implied 2.0% - so this flags the question rather than settling it.
+      out.scenBearVsCons = null;
+      if (out.consMargin !== null && mLo !== null && isFinite(mLo)) {
+        var pm = function (x) { return (x * 100).toFixed(1) + '%'; };
+        out.scenBearVsCons = (mLo >= out.consMargin ? 'ABOVE CONSENSUS - this is the base case, not a bear case: ' : '') +
+          'bear ' + pm(mLo) + ' vs consensus ' + pm(out.consMargin) + ' at the second forecast year';
+      }
       out.scenAdjusted = set_(sc.bearG) || set_(sc.bullG) || set_(sc.bearM) || set_(sc.bullM) || set_(sc.pBear);
       out.scenPBearOvr = sc.pBear === undefined ? null : sc.pBear;
       out.scenWhy = sc.why || '';
@@ -1842,6 +1868,12 @@ function valueCompany(raw, mkt, fx, ovr, S, past, today) {
   // quarter while cutting its price target 18-24% on the risk to its data-centre pipeline. Tracking only the
   // estimate revision saw the good half of that and missed the warning.
   out.targetChange = past && past.tgtOld > 0 && out.analystTarget > 0 ? out.analystTarget / past.tgtOld - 1 : null;
+  // Say which it is. A blank here fed tgtCut, and tgtCut gates analystsAgree, so with no history the "targets
+  // are being cut" test has never once fired - for any stock, since the model was built. That is a silent pass,
+  // not a pass on the evidence, and it should be visible in the row rather than inferred from an empty cell.
+  out.targetChangeBasis = out.targetChange !== null
+    ? 'vs ' + Math.round(past.tgtAge) + ' days ago'
+    : (out.analystTarget > 0 ? 'no History row 14-120 days old yet: target cut check cannot run' : '');
   out.signalText = keys.map(function (k) { return k + (sig[k] === null ? ' –' : sig[k] ? ' ↑' : ' ↓'); }).join('  ');
   setupFor_(out, raw, price, eps, type, S);
   return out;
@@ -1995,6 +2027,9 @@ var CALC_COLS = [
   ['Scenario span (measured)', '0.0x', 'scenSpanM'], ['Scenario probabilities (measured)', '@', 'scenProbTextM'],
   ['Scenario drivers used', '@', 'scenBasis'], ['Scenario drivers measured', '@', 'scenMeasured'],
   ['Scenario adjusted', '@', 'scenAdjustedText'], ['Reason for the adjustment', '@', 'scenWhy'],
+  ['Consensus revenue growth (to FY2)', '0.0%;[Red]-0.0%', 'consRevGrowth'],
+  ['Consensus net margin (FY2)', '0.0%;[Red]-0.0%', 'consMargin'],
+  ['Bear margin vs consensus', '@', 'scenBearVsCons'],
   ['Dividend yield', '0.0%', 'divYield'],
   ['Revenue growth 1-yr', '0.0%;[Red]-0.0%', 'revYoY'], ['Revenue growth 3-yr CAGR', '0.0%;[Red]-0.0%', 'revCagr3'],
   ['Gross margin', '0.0%;[Red]-0.0%', 'grossMargin'], ['Operating margin', '0.0%;[Red]-0.0%', 'opMargin'],
@@ -2004,6 +2039,7 @@ var CALC_COLS = [
   ['Data as of', '@', 'dataDate'], ['Notes', '@', 'notesText'],
   ['Analyst target', '#,##0.00', 'analystTarget'], ['Analyst target upside', '0.0%;[Red]-0.0%', 'F:tupside'],
   ['Analyst target change 30d', '+0.0%;[Red]-0.0%', 'targetChange'],
+  ['Analyst target change basis', '@', 'targetChangeBasis'],
   ['Analysts', '0', 'analysts'],
   ['EPS for PEG', '#,##0.00', 'pegEps'], ['Expected EPS growth', '0.0%;[Red]-0.0%', 'epsGrowth'], ['PEG basis', '@', 'epsGrowthBasis'],
   ['PEG', '0.00', 'F:peg'], ['Expectations gap (implied - expected growth)', '+0.0%;[Red]-0.0%', 'expGap'],
@@ -2227,7 +2263,11 @@ function historyIndex_(today) {
     }
     // ~30 days back, for the analyst target comparison. Targets move on news rather than on a quarterly
     // cycle, so a month is the useful window; the snapshot is weekly, hence the tolerance.
-    if (age >= 21 && age <= 75 && typeof r[7] === 'number' && r[7] > 0 &&
+    // Widened from 21-75 to 14-120 days on 24 November 2026. With a weekly snapshot and a History tab only a
+    // few weeks old, the narrow window matched nothing and the column came out blank for all 396 rows - and a
+    // blank reads as "targets have not moved" rather than "this was never measured". tgtAge is reported beside
+    // it now so the distinction is visible.
+    if (age >= 14 && age <= 120 && typeof r[7] === 'number' && r[7] > 0 &&
       (cur.tgtAge === null || Math.abs(age - 30) < Math.abs(cur.tgtAge - 30))) {
       cur.tgtOld = r[7]; cur.tgtAge = age;
     }
@@ -3283,8 +3323,13 @@ function buildStockView_() {
   // The drivers, always shown. Where the Scenarios tab has adjusted them, the measured calculation and the
   // stated reason follow underneath, so an adjustment is read next to the figure it replaced rather than instead
   // of it. Renaming this column to 'Scenario drivers used' is what silently emptied this line once already.
+  // The bear margin against what analysts already forecast, on the line underneath. Without it a bear case can
+  // sit at or above the base case and read as diligence: 12 of the 294 names with a consensus margin are in
+  // exactly that position, Meta among them, and nothing in the sheet said so before 24 November 2026.
   sh.getRange('B78:P80').merge().getCell(1, 1)
-    .setFormula('=' + svLook_(SHEET2.CALC, 'Scenario drivers measured'))
+    .setFormula('=' + svLook_(SHEET2.CALC, 'Scenario drivers measured') +
+      '&IF(' + svLook_(SHEET2.CALC, 'Bear margin vs consensus') + '="","",CHAR(10)&' +
+      svLook_(SHEET2.CALC, 'Bear margin vs consensus') + ')')
     .setFontColor('#888780').setFontSize(9).setWrap(true).setVerticalAlignment('top');
   sh.getRange('J70:P70').merge().getCell(1, 1).setFormula('="Worse of the two downside cases: "&' +
     'IFERROR(TEXT(' + svLook_(SHEET2.CALC, 'Downside (worse case, measured)') + ',"+0%;-0%"),"n/a")').setFontWeight('bold').setFontColor('#791F1F');
